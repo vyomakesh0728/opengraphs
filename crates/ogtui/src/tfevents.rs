@@ -45,15 +45,15 @@ pub struct SummaryValue {
     // We skip other value types (image, histo, tensor, etc.) — only scalars matter.
 }
 
-// ── Public types ────────────────────────────────────────────────────────────
-
 /// A parsed scalar event.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ScalarEvent {
     pub tag: String,
     pub step: i64,
     pub wall_time: f64,
     pub value: f64,
+    pub run_name: String,
 }
 
 // ── Record-level reader ─────────────────────────────────────────────────────
@@ -107,7 +107,8 @@ fn read_record(cursor: &mut Cursor<&[u8]>) -> Result<Option<Vec<u8>>> {
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Parse all scalar events from a single `.tfevents` file.
-pub fn parse_events_file(path: &Path) -> Result<Vec<ScalarEvent>> {
+#[allow(dead_code)]
+pub fn parse_events_file(path: &Path, run_name: &str) -> Result<Vec<ScalarEvent>> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let mut cursor = Cursor::new(bytes.as_slice());
     let mut events = Vec::new();
@@ -124,6 +125,7 @@ pub fn parse_events_file(path: &Path) -> Result<Vec<ScalarEvent>> {
                         step: event.step,
                         wall_time: event.wall_time,
                         value: sv as f64,
+                        run_name: run_name.to_string(),
                     });
                 }
             }
@@ -134,42 +136,228 @@ pub fn parse_events_file(path: &Path) -> Result<Vec<ScalarEvent>> {
 }
 
 /// Discover all `.tfevents` files in a directory (recursively) and parse them.
-/// Returns a map from tag → sorted list of (step, value).
-pub fn load_scalars(dir: &Path) -> Result<BTreeMap<String, Vec<(f64, f64)>>> {
-    let mut all_events: Vec<ScalarEvent> = Vec::new();
+/// Returns tag → { run_name → sorted [(step, value)] }.
+/// Each first-level subdirectory is treated as a separate "run".
+#[allow(dead_code)]
+pub fn load_scalars(dir: &Path) -> Result<BTreeMap<String, BTreeMap<String, Vec<(f64, f64)>>>> {
+    let reader = IncrementalReader::new(dir)?;
+    let scalars = reader.scalars.clone();
+    // Drop reader — use IncrementalReader::new() directly if you want live updates
+    let _ = reader;
+    Ok(scalars)
+}
 
-    if dir.is_file() {
-        all_events.extend(parse_events_file(dir)?);
-    } else {
-        for entry in walkdir(dir)? {
-            if entry
-                .file_name()
+// ── Incremental Reader ──────────────────────────────────────────────────────
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+/// Tracks byte offsets into tfevents files to enable incremental parsing.
+/// Only reads newly appended bytes on each `poll()` call.
+pub struct IncrementalReader {
+    /// Root directory being watched
+    root: PathBuf,
+    /// Whether root is a single file
+    is_file: bool,
+    /// file_path → (run_name, last_read_byte_offset)
+    file_offsets: HashMap<PathBuf, (String, u64)>,
+    /// Accumulated scalars: tag → { run → sorted [(step, value)] }
+    pub scalars: BTreeMap<String, BTreeMap<String, Vec<(f64, f64)>>>,
+    /// Total events parsed so far
+    pub total_events: usize,
+    /// Max step seen
+    pub max_step: i64,
+    /// All log lines
+    pub log_lines: Vec<String>,
+    /// Ordered run names
+    pub run_names: Vec<String>,
+}
+
+impl IncrementalReader {
+    /// Create a new reader, performing the initial full parse.
+    pub fn new(dir: &Path) -> Result<Self> {
+        let is_file = dir.is_file();
+        let mut reader = Self {
+            root: dir.to_path_buf(),
+            is_file,
+            file_offsets: HashMap::new(),
+            scalars: BTreeMap::new(),
+            total_events: 0,
+            max_step: 0,
+            log_lines: vec!["-- parsed events log --".to_string(), String::new()],
+            run_names: Vec::new(),
+        };
+
+        // Discover and parse all files initially
+        let files = reader.discover_files()?;
+        for (path, run_name) in files {
+            reader.parse_file_from_offset(&path, &run_name, 0)?;
+        }
+
+        reader.rebuild_run_names();
+        Ok(reader)
+    }
+
+    /// Poll for new data. Reads only bytes appended since last read.
+    /// Also discovers any new files that appeared.
+    /// Returns true if any new data was found.
+    pub fn poll(&mut self) -> Result<bool> {
+        let mut found_new = false;
+
+        // Check for new files
+        let current_files = self.discover_files()?;
+        for (path, run_name) in &current_files {
+            if !self.file_offsets.contains_key(path) {
+                // New file discovered
+                self.parse_file_from_offset(path, run_name, 0)?;
+                found_new = true;
+            }
+        }
+
+        // Re-read existing files from last offset
+        let existing: Vec<(PathBuf, String, u64)> = self.file_offsets.iter()
+            .map(|(p, (r, o))| (p.clone(), r.clone(), *o))
+            .collect();
+
+        for (path, run_name, offset) in existing {
+            // Check if file has grown
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let file_len = meta.len();
+                if file_len > offset {
+                    self.parse_file_from_offset(&path, &run_name, offset)?;
+                    found_new = true;
+                }
+            }
+        }
+
+        if found_new {
+            // Re-sort series that may have new data
+            for runs in self.scalars.values_mut() {
+                for series in runs.values_mut() {
+                    series.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                }
+            }
+            self.rebuild_run_names();
+        }
+
+        Ok(found_new)
+    }
+
+    /// Parse a file starting at `offset` bytes. Updates internal state.
+    fn parse_file_from_offset(&mut self, path: &Path, run_name: &str, offset: u64) -> Result<()> {
+        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        if (offset as usize) >= bytes.len() {
+            // No new data
+            self.file_offsets.insert(path.to_path_buf(), (run_name.to_string(), bytes.len() as u64));
+            return Ok(());
+        }
+
+        let slice = &bytes[offset as usize..];
+        let mut cursor = Cursor::new(slice);
+
+        loop {
+            let pos_before = cursor.position();
+            match read_record(&mut cursor) {
+                Ok(Some(data)) => {
+                    match Event::decode(data.as_slice()) {
+                        Ok(event) => {
+                            if event.step > self.max_step {
+                                self.max_step = event.step;
+                            }
+                            if let Some(summary) = event.summary {
+                                for val in summary.value {
+                                    if let Some(sv) = val.simple_value {
+                                        self.total_events += 1;
+                                        let step = event.step as f64;
+                                        let value = sv as f64;
+
+                                        self.scalars
+                                            .entry(val.tag.clone())
+                                            .or_default()
+                                            .entry(run_name.to_string())
+                                            .or_default()
+                                            .push((step, value));
+
+                                        self.log_lines.push(format!(
+                                            "step {:>6} │ {:<30} │ {:.6} │ {}",
+                                            event.step, val.tag, value, run_name
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Skip malformed record
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    // Partial record (file still being written) — rewind to before this record
+                    let final_offset = offset + pos_before;
+                    self.file_offsets.insert(path.to_path_buf(), (run_name.to_string(), final_offset));
+                    return Ok(());
+                }
+            }
+        }
+
+        // Successfully read to end
+        self.file_offsets.insert(path.to_path_buf(), (run_name.to_string(), bytes.len() as u64));
+        Ok(())
+    }
+
+    /// Discover all tfevents files under root, returning (path, run_name) pairs.
+    fn discover_files(&self) -> Result<Vec<(PathBuf, String)>> {
+        let mut result = Vec::new();
+
+        if self.is_file {
+            let run_name = self.root.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            result.push((self.root.clone(), run_name));
+            return Ok(result);
+        }
+
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                let run_name = path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                for file_path in walkdir(&path)? {
+                    if file_path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .contains("tfevents")
+                    {
+                        result.push((file_path, run_name.clone()));
+                    }
+                }
+            } else if path.file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .contains("tfevents")
             {
-                match parse_events_file(&entry) {
-                    Ok(evts) => all_events.extend(evts),
-                    Err(e) => eprintln!("warning: skipping {}: {e}", entry.display()),
-                }
+                result.push((path, "default".to_string()));
             }
         }
+
+        Ok(result)
     }
 
-    let mut scalars: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
-    for ev in all_events {
-        scalars
-            .entry(ev.tag)
-            .or_default()
-            .push((ev.step as f64, ev.value));
+    /// Rebuild the ordered list of run names from current scalars.
+    fn rebuild_run_names(&mut self) {
+        let mut run_set = std::collections::BTreeSet::new();
+        for runs in self.scalars.values() {
+            for run_name in runs.keys() {
+                run_set.insert(run_name.clone());
+            }
+        }
+        self.run_names = run_set.into_iter().collect();
     }
-
-    // Sort each series by step
-    for series in scalars.values_mut() {
-        series.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    }
-
-    Ok(scalars)
 }
 
 /// Simple recursive directory walk (avoids adding walkdir dependency).

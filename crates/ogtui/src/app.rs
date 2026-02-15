@@ -29,10 +29,12 @@ impl Tab {
 /// Application state.
 pub struct App {
     pub active_tab: Tab,
-    /// tag → sorted (step, value) pairs
-    pub scalars: BTreeMap<String, Vec<(f64, f64)>>,
+    /// tag → { run_name → sorted (step, value) pairs }
+    pub scalars: BTreeMap<String, BTreeMap<String, Vec<(f64, f64)>>>,
     /// Ordered list of tag names for grid iteration
     pub tags: Vec<String>,
+    /// Ordered list of run names for color assignment
+    pub run_names: Vec<String>,
     /// Log lines derived from events
     pub log_lines: Vec<String>,
     /// Whether the help overlay is shown
@@ -63,17 +65,26 @@ pub struct App {
 
 impl App {
     pub fn new(
-        scalars: BTreeMap<String, Vec<(f64, f64)>>,
+        scalars: BTreeMap<String, BTreeMap<String, Vec<(f64, f64)>>>,
         log_lines: Vec<String>,
         events_path: PathBuf,
         total_events: usize,
         max_step: i64,
     ) -> Self {
         let tags: Vec<String> = scalars.keys().cloned().collect();
+        // Collect all unique run names across all tags
+        let mut run_set = std::collections::BTreeSet::new();
+        for runs in scalars.values() {
+            for run_name in runs.keys() {
+                run_set.insert(run_name.clone());
+            }
+        }
+        let run_names: Vec<String> = run_set.into_iter().collect();
         Self {
             active_tab: Tab::Graphs,
             scalars,
             tags,
+            run_names,
             log_lines,
             show_help: false,
             events_path,

@@ -21,6 +21,22 @@ const BG_DARK: Color = Color::Rgb(13, 17, 23);    // #0d1117
 const CHART_RAW: Color = Color::Rgb(100, 149, 237); // cornflower blue for raw data
 const CHART_SMOOTH: Color = Color::Rgb(255, 165, 0); // orange for smoothed
 
+/// Distinct colors for different runs (up to 8, then cycles).
+const RUN_COLORS: &[Color] = &[
+    Color::Rgb(100, 149, 237), // cornflower blue
+    Color::Rgb(255, 165, 0),   // orange
+    Color::Rgb(46, 204, 113),  // emerald green
+    Color::Rgb(231, 76, 60),   // red
+    Color::Rgb(155, 89, 182),  // purple
+    Color::Rgb(26, 188, 156),  // teal
+    Color::Rgb(241, 196, 15),  // yellow
+    Color::Rgb(230, 126, 163), // pink
+];
+
+fn run_color(run_idx: usize) -> Color {
+    RUN_COLORS[run_idx % RUN_COLORS.len()]
+}
+
 /// Clickable regions tracked for mouse hit-testing.
 #[derive(Default, Clone)]
 pub struct LayoutRegions {
@@ -309,29 +325,39 @@ fn draw_metric_card(f: &mut Frame, app: &App, tag: &str, area: Rect, selected: b
         return;
     }
 
-    if let Some(data) = app.scalars.get(tag) {
-        if data.is_empty() {
+    if let Some(runs) = app.scalars.get(tag) {
+        if runs.is_empty() {
             let p = Paragraph::new("--").style(Style::default().fg(TEXT_DIM));
             f.render_widget(p, inner);
             return;
         }
 
-        // Show latest value as text at bottom
-        let latest = data.last().unwrap();
-        let latest_text = format_value(latest.1);
+        // Compute bounds across all runs
+        let mut x_min = f64::INFINITY;
+        let mut x_max = f64::NEG_INFINITY;
+        let mut y_min = f64::INFINITY;
+        let mut y_max = f64::NEG_INFINITY;
+        let mut latest_val: Option<f64> = None;
 
-        // Compute bounds
-        let x_min = data.first().unwrap().0;
-        let x_max = data.last().unwrap().0.max(x_min + 1.0);
-        let y_min = data.iter().map(|d| d.1).fold(f64::INFINITY, f64::min);
-        let y_max = data.iter().map(|d| d.1).fold(f64::NEG_INFINITY, f64::max);
+        for data in runs.values() {
+            if data.is_empty() { continue; }
+            x_min = x_min.min(data.first().unwrap().0);
+            x_max = x_max.max(data.last().unwrap().0);
+            for &(_, v) in data {
+                y_min = y_min.min(v);
+                y_max = y_max.max(v);
+            }
+            if latest_val.is_none() {
+                latest_val = Some(data.last().unwrap().1);
+            }
+        }
+
+        if x_min >= x_max { x_max = x_min + 1.0; }
         let y_margin = (y_max - y_min).abs() * 0.1;
         let y_lo = y_min - y_margin;
-        let y_hi = if (y_max - y_min).abs() < 1e-12 {
-            y_max + 1.0
-        } else {
-            y_max + y_margin
-        };
+        let y_hi = if (y_max - y_min).abs() < 1e-12 { y_max + 1.0 } else { y_max + y_margin };
+
+        let latest_text = latest_val.map(format_value).unwrap_or_else(|| "--".into());
 
         // Chart area = inner minus 1 line for value text
         let chart_area_height = inner.height.saturating_sub(1);
@@ -348,14 +374,21 @@ fn draw_metric_card(f: &mut Frame, app: &App, tag: &str, area: Rect, selected: b
             height: 1,
         };
 
-        // Build dataset
-        let dataset = Dataset::default()
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(CHART_RAW))
-            .data(data);
+        // Build one dataset per run
+        let datasets: Vec<Dataset> = runs.iter().enumerate()
+            .map(|(run_idx, (_run_name, data))| {
+                let color = run_color(
+                    app.run_names.iter().position(|r| r == _run_name).unwrap_or(run_idx)
+                );
+                Dataset::default()
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(color))
+                    .data(data)
+            })
+            .collect();
 
-        let chart = Chart::new(vec![dataset])
+        let chart = Chart::new(datasets)
             .x_axis(
                 Axis::default()
                     .bounds([x_min, x_max])
@@ -549,8 +582,8 @@ fn draw_focused_metric(f: &mut Frame, app: &App, metric_idx: usize, area: Rect) 
         }
     };
 
-    let data = match app.scalars.get(tag) {
-        Some(d) if !d.is_empty() => d,
+    let runs = match app.scalars.get(tag) {
+        Some(r) if !r.is_empty() => r,
         _ => {
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -565,27 +598,48 @@ fn draw_focused_metric(f: &mut Frame, app: &App, metric_idx: usize, area: Rect) 
         }
     };
 
-    // Compute statistics
-    let x_min = data.first().unwrap().0;
-    let x_max = data.last().unwrap().0.max(x_min + 1.0);
-    let y_min = data.iter().map(|d| d.1).fold(f64::INFINITY, f64::min);
-    let y_max = data.iter().map(|d| d.1).fold(f64::NEG_INFINITY, f64::max);
+    // Compute statistics across all runs
+    let mut x_min = f64::INFINITY;
+    let mut x_max = f64::NEG_INFINITY;
+    let mut y_min = f64::INFINITY;
+    let mut y_max = f64::NEG_INFINITY;
+    let mut total_points: usize = 0;
+
+    for data in runs.values() {
+        if data.is_empty() { continue; }
+        x_min = x_min.min(data.first().unwrap().0);
+        x_max = x_max.max(data.last().unwrap().0);
+        for &(_, v) in data {
+            y_min = y_min.min(v);
+            y_max = y_max.max(v);
+        }
+        total_points += data.len();
+    }
+
+    if x_min >= x_max { x_max = x_min + 1.0; }
     let y_margin = (y_max - y_min).abs() * 0.05;
     let y_lo = y_min - y_margin;
     let y_hi = if (y_max - y_min).abs() < 1e-12 { y_max + 1.0 } else { y_max + y_margin };
-    let latest = data.last().unwrap().1;
-    let count = data.len();
 
-    // Stats line
-    let stats_text = format!(
-        "latest: {}  │  min: {}  │  max: {}  │  points: {}  │  steps: {:.0}–{:.0}",
-        format_value(latest),
-        format_value(y_min),
-        format_value(y_max),
-        count,
-        x_min,
-        x_max,
-    );
+    // Build stats line with per-run legend
+    let mut stats_spans: Vec<Span> = Vec::new();
+    stats_spans.push(Span::styled(
+        format!("min: {}  │  max: {}  │  points: {}  │  steps: {:.0}–{:.0}",
+            format_value(y_min), format_value(y_max), total_points, x_min, x_max),
+        Style::default().fg(CHART_SMOOTH),
+    ));
+
+    if runs.len() > 1 {
+        stats_spans.push(Span::styled("  │  ", Style::default().fg(BORDER)));
+        for (run_name, data) in runs.iter() {
+            let run_idx = app.run_names.iter().position(|r| r == run_name).unwrap_or(0);
+            let color = run_color(run_idx);
+            let latest = data.last().map(|d| format_value(d.1)).unwrap_or_else(|| "--".into());
+            // Short run name (first 8 chars)
+            let short_name: String = run_name.chars().take(8).collect();
+            stats_spans.push(Span::styled(format!("■ {}:{} ", short_name, latest), Style::default().fg(color)));
+        }
+    }
 
     // Layout: chart body | stats line (1)
     let chunks = Layout::default()
@@ -613,15 +667,22 @@ fn draw_focused_metric(f: &mut Frame, app: &App, metric_idx: usize, area: Rect) 
         Span::styled(format_value(y_hi), Style::default().fg(TEXT_DIM)),
     ];
 
-    let dataset = Dataset::default()
-        .name(tag)
-        .marker(symbols::Marker::Braille)
-        .graph_type(GraphType::Line)
-        .style(Style::default().fg(CHART_RAW));
+    // Build one dataset per run with color and name
+    let datasets: Vec<Dataset> = runs.iter().enumerate()
+        .map(|(i, (run_name, data))| {
+            let run_idx = app.run_names.iter().position(|r| r == run_name).unwrap_or(i);
+            let color = run_color(run_idx);
+            let short_name: String = run_name.chars().take(12).collect();
+            Dataset::default()
+                .name(short_name)
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(color))
+                .data(data)
+        })
+        .collect();
 
-    let dataset = dataset.data(data);
-
-    let chart = Chart::new(vec![dataset])
+    let chart = Chart::new(datasets)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -655,11 +716,8 @@ fn draw_focused_metric(f: &mut Frame, app: &App, metric_idx: usize, area: Rect) 
 
     f.render_widget(chart, chunks[0]);
 
-    // Stats bar
-    let stats = Paragraph::new(Line::from(Span::styled(
-        stats_text,
-        Style::default().fg(CHART_SMOOTH),
-    )))
-    .alignment(Alignment::Center);
+    // Stats bar with run legend
+    let stats = Paragraph::new(Line::from(stats_spans))
+        .alignment(Alignment::Center);
     f.render_widget(stats, chunks[1]);
 }

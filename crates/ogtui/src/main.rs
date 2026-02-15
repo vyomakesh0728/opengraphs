@@ -27,58 +27,17 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // ── Parse TF events ─────────────────────────────────────────────────
-    let scalars = tfevents::load_scalars(&cli.path)
+    // ── Parse TF events via incremental reader ───────────────────────────
+    let reader = tfevents::IncrementalReader::new(&cli.path)
         .with_context(|| format!("loading events from {}", cli.path.display()))?;
 
-    // Build log lines from scalar events
-    let all_events = if cli.path.is_file() {
-        tfevents::parse_events_file(&cli.path)?
-    } else {
-        // Re-parse to get the log lines ordered by step
-        let mut evts = Vec::new();
-        if cli.path.is_dir() {
-            for entry in std::fs::read_dir(&cli.path).into_iter().flatten() {
-                if let Ok(entry) = entry {
-                    let p = entry.path();
-                    if p.is_dir() {
-                        // Look inside subdirectory
-                        for sub in std::fs::read_dir(&p).into_iter().flatten() {
-                            if let Ok(sub) = sub {
-                                let sp = sub.path();
-                                if sp.file_name().unwrap_or_default().to_string_lossy().contains("tfevents") {
-                                    if let Ok(e) = tfevents::parse_events_file(&sp) {
-                                        evts.extend(e);
-                                    }
-                                }
-                            }
-                        }
-                    } else if p.file_name().unwrap_or_default().to_string_lossy().contains("tfevents") {
-                        if let Ok(e) = tfevents::parse_events_file(&p) {
-                            evts.extend(e);
-                        }
-                    }
-                }
-            }
-        }
-        evts
-    };
-
-    let total_events = all_events.len();
-    let max_step = all_events.iter().map(|e| e.step).max().unwrap_or(0);
-
-    // Build log lines
-    let mut log_lines = vec!["-- parsed events log --".to_string(), String::new()];
-    let mut sorted_events = all_events;
-    sorted_events.sort_by_key(|e| e.step);
-    for ev in &sorted_events {
-        log_lines.push(format!(
-            "step {:>6} │ {:<30} │ {:.6}",
-            ev.step, ev.tag, ev.value
-        ));
-    }
-
-    let app = App::new(scalars, log_lines, cli.path.clone(), total_events, max_step);
+    let app = App::new(
+        reader.scalars.clone(),
+        reader.log_lines.clone(),
+        cli.path.clone(),
+        reader.total_events,
+        reader.max_step,
+    );
 
     // ── Setup terminal ──────────────────────────────────────────────────
     enable_raw_mode()?;
@@ -87,7 +46,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, app);
+    let result = run_app(&mut terminal, app, reader);
 
     // ── Restore terminal ────────────────────────────────────────────────
     disable_raw_mode()?;
@@ -101,12 +60,29 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
+fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App, mut reader: tfevents::IncrementalReader) -> Result<()> {
     // Track layout regions for mouse hit-testing
     let mut layout = ui::LayoutRegions::default();
 
+    // Poll for new data every ~3 seconds (15 ticks × 200ms)
+    const POLL_INTERVAL: u64 = 15;
+
     loop {
         app.tick_count = app.tick_count.wrapping_add(1);
+
+        // Periodically check for new data from tfevents files
+        if app.tick_count % POLL_INTERVAL == 0 {
+            if let Ok(true) = reader.poll() {
+                // New data found — update app state
+                let new_tags: Vec<String> = reader.scalars.keys().cloned().collect();
+                app.scalars = reader.scalars.clone();
+                app.tags = new_tags;
+                app.run_names = reader.run_names.clone();
+                app.log_lines = reader.log_lines.clone();
+                app.total_events = reader.total_events;
+                app.max_step = reader.max_step;
+            }
+        }
 
         terminal.draw(|f| {
             layout = ui::draw(f, &mut app);
