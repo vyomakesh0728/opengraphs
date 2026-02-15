@@ -1,0 +1,11 @@
+{
+  "name": "@opengraphs/tui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "tui": "bun run src/index.ts"
+  },
+  "dependencies": {
+    "@opentui/core": "^0.1.79"
+  }
+}

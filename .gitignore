@@ -1,0 +1,13 @@
+target/
+**/target/
+
+node_modules/
+apps/tui/node_modules/
+
+.venv/
+python/**/.venv/
+
+dist/
+coverage/
+
+.DS_Store

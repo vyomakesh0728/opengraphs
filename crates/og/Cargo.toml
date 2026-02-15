@@ -1,0 +1,10 @@
+[package]
+name = "og"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.101"
+clap = { version = "4.5.58", features = ["derive"] }
+ogd = { version = "0.1.0", path = "../ogd" }
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "signal"] }

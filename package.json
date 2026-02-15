@@ -1,0 +1,7 @@
+{
+  "name": "opengraphs",
+  "private": true,
+  "scripts": {
+    "tui": "cd apps/tui && bun run tui"
+  }
+}
