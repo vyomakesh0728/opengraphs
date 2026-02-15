@@ -156,7 +156,21 @@ async def serve(config: DaemonConfig) -> None:
                     await _write_response(writer, {"ok": False, "error": "invalid_json"})
                     continue
 
-                response = await _handle_payload(payload, run_state, agent, alert_detector)
+                try:
+                    response = await _handle_payload(
+                        payload,
+                        run_state,
+                        agent,
+                        alert_detector,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOGGER.exception(
+                        "Payload handler failed for type=%s",
+                        payload.get("type"),
+                    )
+                    response = {"ok": False, "error": "internal_error"}
                 try:
                     await _write_response(writer, response)
                 except (ConnectionResetError, BrokenPipeError, OSError):
