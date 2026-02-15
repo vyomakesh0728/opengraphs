@@ -287,6 +287,28 @@ async def _handle_payload(
         run_state.training_file = Path(path)
         return {"ok": True}
 
+    if msg_type == "apply_refactor":
+        diagnosis = payload.get("diagnosis", "")
+        action = payload.get("action", "refactor")
+        code_changes = payload.get("code_changes", "")
+        raw_output = payload.get("raw_output", "")
+        if not code_changes:
+            return {"ok": False, "error": "missing_code_changes"}
+        plan = ActionPlan(
+            diagnosis=diagnosis,
+            action=action,
+            code_changes=code_changes,
+            raw_output=raw_output,
+        )
+        result = await agent.execute_plan(plan)
+        return {
+            "ok": True,
+            "success": result.success,
+            "checkpoint_id": result.checkpoint_id,
+            "error": result.error,
+            "chat_history": [_serialize_message(msg) for msg in agent.get_chat_history()],
+        }
+
     return {"ok": False, "error": "unknown_type"}
 
 
