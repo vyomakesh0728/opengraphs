@@ -16,8 +16,20 @@ _ensure_deno_dir()
 
 import dspy
 
-_DEFAULT_MODEL = "openai/gpt-4o-mini"
+_DEFAULT_MODEL = "openai/gpt-5.2-codex"
 _configured_lm: Optional[dspy.LM] = None
+
+
+def _sanitize_api_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip().strip('"').strip("'")
+    if cleaned.lower().startswith("bearer "):
+        cleaned = cleaned[7:].strip()
+    cleaned = cleaned.replace("\r", "").replace("\n", "")
+    if not cleaned:
+        return None
+    return cleaned
 
 
 def ensure_dspy_configured(
@@ -32,9 +44,10 @@ def ensure_dspy_configured(
         return _configured_lm
 
     model_name = model or os.getenv("OG_AGENT_MODEL", _DEFAULT_MODEL)
-    api_key = api_key or os.getenv("OG_AGENT_API_KEY")
+    api_key = _sanitize_api_key(api_key or os.getenv("OG_AGENT_API_KEY"))
     api_base = api_base or os.getenv("OG_AGENT_API_BASE")
     model_type = model_type or os.getenv("OG_AGENT_MODEL_TYPE")
+    reasoning_effort = os.getenv("OG_AGENT_REASONING_EFFORT")
 
     api_key = _resolve_provider_api_key(model_name, api_key)
 
@@ -46,8 +59,14 @@ def ensure_dspy_configured(
 
     if api_base:
         lm_kwargs["api_base"] = api_base
+    if not model_type and model_name.startswith("openai/gpt-5"):
+        model_type = "responses"
     if model_type:
         lm_kwargs["model_type"] = model_type
+    if not reasoning_effort and model_name == "openai/gpt-5.2-codex":
+        reasoning_effort = "high"
+    if reasoning_effort:
+        lm_kwargs["reasoning_effort"] = reasoning_effort
 
     lm = dspy.LM(model_name, **lm_kwargs)
     dspy.configure(lm=lm)
@@ -57,9 +76,13 @@ def ensure_dspy_configured(
 
 def _resolve_provider_api_key(model_name: str, api_key: str | None) -> str | None:
     if api_key:
-        return api_key
+        return _sanitize_api_key(api_key)
     if model_name.startswith("openai/"):
-        return os.getenv("OPENAI_API_KEY") or os.getenv("OG_AGENT_OPENAI_API_KEY")
+        return _sanitize_api_key(
+            os.getenv("OPENAI_API_KEY") or os.getenv("OG_AGENT_OPENAI_API_KEY")
+        )
     if model_name.startswith("anthropic/"):
-        return os.getenv("ANTHROPIC_API_KEY") or os.getenv("OG_AGENT_ANTHROPIC_API_KEY")
+        return _sanitize_api_key(
+            os.getenv("ANTHROPIC_API_KEY") or os.getenv("OG_AGENT_ANTHROPIC_API_KEY")
+        )
     return None

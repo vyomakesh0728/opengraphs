@@ -197,7 +197,7 @@ pub fn apply_refactor(
 /// Get run state from the daemon.
 pub fn get_run_state(sock_path: &Path) -> Result<RunStateResponse, ClientError> {
     let resp = send_request(
-        &serde_json::json!({"type": "get_run_state", "log_tail": 200, "metric_tail": 1}),
+        &serde_json::json!({"type": "get_run_state", "log_tail": 200, "metric_tail": 64}),
         sock_path,
     )?;
 

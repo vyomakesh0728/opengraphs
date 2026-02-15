@@ -4,6 +4,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, Sequence
 
 from .models import Alert, RunState
@@ -144,3 +145,28 @@ def load_alert_rules_from_env(env_var: str = "OG_ALERT_RULES") -> list[AlertRule
                 )
             )
     return rules
+
+
+def default_alert_rules(training_file: str | Path | None = None) -> list[AlertRule]:
+    if not training_file:
+        return []
+    try:
+        name = Path(training_file).name
+    except TypeError:
+        return []
+
+    # Opinionated defaults for the local demo script so --auto can react
+    # without requiring explicit OG_ALERT_RULES.
+    if name == "demo_train.py":
+        return [
+            StallRule(
+                metric="train/loss",
+                window=int(os.getenv("OG_DEMO_STALL_WINDOW", "20")),
+                min_delta=float(os.getenv("OG_DEMO_STALL_MIN_DELTA", "0.05")),
+                direction="decrease",
+                cooldown_secs=float(os.getenv("OG_DEMO_ALERT_COOLDOWN_SECS", "20")),
+                message="train/loss stopped improving; learning rate may be too high",
+            )
+        ]
+
+    return []

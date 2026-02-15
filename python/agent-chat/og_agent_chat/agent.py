@@ -15,18 +15,34 @@ from .models import ActionPlan, Alert, ChatMessage, ExecutionResult, RunState
 
 SYSTEM_PROMPT = """
 You are an ML training assistant for OpenGraphs.
-Role: Diagnose issues and suggest code fixes when metrics plateau/degrade.
+Role: Diagnose issues and suggest safe code fixes when metrics plateau/degrade.
+
+Operating policy:
+1. Prefer small, reversible refactors over large rewrites.
+2. Use logs + metric trend direction, not a single noisy point.
+3. If recent refactors are not improving the target metric, stop proposing further code edits.
+   In that case, set ACTION: explain and provide concrete checks (data, LR schedule, optimizer state,
+   grad clipping, batch size, seed, and hardware/resource bottlenecks).
+4. Never invent files or paths. Only modify the provided training script unless explicitly asked.
+5. For refactors, produce a syntactically valid unified diff that can be applied directly.
+   Do not wrap the diff in markdown fences.
+6. For demo_train.py stabilization, prefer changing all three knobs together:
+   LEARNING_RATE -> 0.001, WARMUP_STEPS -> 20, PEAK_LR_MULT -> 1.0.
 
 Response format:
 DIAGNOSIS: <analysis of the problem>
 ACTION: <explain|refactor>
-CODE_CHANGES: <if refactor, provide unified diff starting with --- and +++>
+CODE_CHANGES: <if refactor, provide unified diff starting with --- and +++ for one file>
 """.strip()
 
 EDITOR_QUERY_TEMPLATE = """
 You are editing the training script for OpenGraphs.
-Provide ONLY a unified diff (---/+++ headers) for the requested fix.
+Provide ONLY a strict unified diff (---/+++ headers) for the requested fix.
 If no code change is required, return an empty string.
+Rules:
+- Output raw diff text only (no markdown fences, no commentary).
+- Target exactly one file: the training script path below.
+- Keep hunks minimal and preserve surrounding context lines.
 
 Alert:
 {alert_block}
@@ -379,6 +395,14 @@ class AgentEngine:
         alert = alert or self.run_state.latest_alert()
         if not alert:
             return None
+        self.add_chat_message(
+            "system",
+            (
+                "Alert triggered: "
+                f"metric={alert.metric}, threshold={alert.threshold}, "
+                f"current={alert.current}, message={alert.message}"
+            ),
+        )
         question = (
             "Alert triggered: "
             f"metric={alert.metric}, threshold={alert.threshold}, "
@@ -396,17 +420,36 @@ class AgentEngine:
             self.codebase_index,
             alert=alert,
         )
-        raw = self.tool_caller.run(context=context, question=question)
-        plan = self.action_planner.parse_response(raw)
-        if plan.action == "refactor" and not plan.code_changes:
-            diff = self.editor.propose_diff(self.run_state, plan.diagnosis, alert=alert)
+        raw = ""
+        plan: ActionPlan
+        try:
+            raw = self.tool_caller.run(context=context, question=question)
+            plan = self.action_planner.parse_response(raw)
+            if plan.action == "refactor" and not plan.code_changes:
+                diff = self.editor.propose_diff(self.run_state, plan.diagnosis, alert=alert)
+                plan = ActionPlan(
+                    diagnosis=plan.diagnosis,
+                    action=plan.action,
+                    code_changes=diff.strip(),
+                    raw_output=raw,
+                )
+        except Exception as exc:
+            raw = f"[fallback] agent unavailable: {exc}"
             plan = ActionPlan(
-                diagnosis=plan.diagnosis,
-                action=plan.action,
-                code_changes=diff.strip(),
+                diagnosis=f"Agent unavailable: {type(exc).__name__}: {exc}",
+                action="explain",
+                code_changes="",
                 raw_output=raw,
             )
         self.add_chat_message("agent", plan.diagnosis)
+        if plan.action == "refactor" and plan.code_changes:
+            self.add_chat_message(
+                "agent",
+                "Proposed refactor diff:\n" + plan.code_changes,
+            )
+            summary = self._summarize_diff_changes(plan.code_changes)
+            if summary:
+                self.add_chat_message("system", summary)
         if plan.action == "refactor" and self.executor.auto_mode:
             result = await self.executor.execute(plan, self.run_state)
             if result.success:
@@ -420,6 +463,43 @@ class AgentEngine:
                     f"Refactor failed: {result.error}. Rolled back.",
                 )
         return AgentResponse(raw_output=raw, plan=plan)
+
+    @staticmethod
+    def _summarize_diff_changes(diff_text: str) -> str:
+        assignment_re = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$")
+        removed: dict[str, str] = {}
+        added: dict[str, str] = {}
+
+        for raw_line in diff_text.splitlines():
+            if raw_line.startswith("---") or raw_line.startswith("+++") or raw_line.startswith("@@"):
+                continue
+            if raw_line.startswith("-"):
+                line = raw_line[1:]
+                m = assignment_re.match(line)
+                if m:
+                    removed[m.group(1)] = m.group(2)
+            elif raw_line.startswith("+"):
+                line = raw_line[1:]
+                m = assignment_re.match(line)
+                if m:
+                    added[m.group(1)] = m.group(2)
+
+        changes: list[str] = []
+        for key in sorted(set(removed.keys()) | set(added.keys())):
+            before = removed.get(key)
+            after = added.get(key)
+            if before and after and before != after:
+                changes.append(f"{key}: {before} -> {after}")
+            elif after and not before:
+                changes.append(f"{key}: set to {after}")
+            elif before and not after:
+                changes.append(f"{key}: removed")
+
+        if not changes:
+            return ""
+        shown = changes[:5]
+        suffix = " ..." if len(changes) > len(shown) else ""
+        return "Refactor summary: " + " | ".join(shown) + suffix
 
     async def execute_plan(self, plan: ActionPlan) -> ExecutionResult:
         """Execute a refactor plan (called from TUI approve, bypasses auto_mode)."""
@@ -494,15 +574,22 @@ def restore_checkpoint(checkpoint_id: str, run_state: RunState, checkpoint_dir: 
 
 
 def apply_diff(filepath: Path, diff_text: str) -> None:
-    patch = unidiff.PatchSet(diff_text)
+    normalized_diff = _normalize_diff_text(diff_text)
+    patch = unidiff.PatchSet(normalized_diff)
     if not patch:
         raise ValueError("Empty diff provided.")
-    if len(patch) != 1:
-        raise ValueError("Diff must target exactly one file.")
 
-    patch_file = patch[0]
-    if not _patch_targets_file(filepath, patch_file.path):
+    target_patches = [
+        patch_file
+        for patch_file in patch
+        if _patch_file_targets_filepath(filepath, patch_file)
+    ]
+    if not target_patches:
         raise ValueError("Diff does not target the training file.")
+    if len(target_patches) > 1:
+        raise ValueError("Diff targets the training file multiple times.")
+
+    patch_file = target_patches[0]
 
     original_lines = filepath.read_text(encoding="utf-8").splitlines(keepends=True)
     updated_lines = _apply_patch_hunks(original_lines, patch_file)
@@ -512,14 +599,71 @@ def apply_diff(filepath: Path, diff_text: str) -> None:
     tmp_path.replace(filepath)
 
 
-def _patch_targets_file(filepath: Path, patch_path: str) -> bool:
-    normalized = patch_path
-    if normalized.startswith("a/") or normalized.startswith("b/"):
+def _normalize_diff_text(diff_text: str) -> str:
+    lines = diff_text.strip().splitlines()
+    if not lines:
+        return ""
+
+    # LLMs often wrap diffs in fenced code blocks.
+    lines = [line for line in lines if not line.strip().startswith("```")]
+
+    start_index = 0
+    for idx, line in enumerate(lines):
+        if line.startswith("diff --git ") or line.startswith("--- "):
+            start_index = idx
+            break
+
+    normalized = "\n".join(lines[start_index:]).strip()
+    if normalized:
+        normalized += "\n"
+    return normalized
+
+
+def _normalize_patch_path(patch_path: str | None) -> str:
+    normalized = (patch_path or "").strip().strip('"').strip("'")
+    if not normalized:
+        return ""
+    if normalized.startswith("file://"):
+        normalized = normalized[len("file://") :]
+    normalized = normalized.replace("\\", "/")
+    if "\t" in normalized:
+        normalized = normalized.split("\t", 1)[0]
+    while normalized.startswith("a/") or normalized.startswith("b/"):
         normalized = normalized[2:]
-    if filepath.as_posix().endswith(normalized):
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if normalized == "/dev/null":
+        return ""
+    return normalized
+
+
+def _patch_file_targets_filepath(
+    filepath: Path,
+    patch_file: unidiff.PatchedFile,
+) -> bool:
+    for patch_path in [patch_file.path, patch_file.source_file, patch_file.target_file]:
+        if _patch_targets_file(filepath, patch_path):
+            return True
+    return False
+
+
+def _patch_targets_file(filepath: Path, patch_path: str | None) -> bool:
+    normalized = _normalize_patch_path(patch_path)
+    if not normalized:
+        return False
+
+    file_path = filepath.as_posix().replace("\\", "/")
+    resolved_path = filepath.resolve().as_posix().replace("\\", "/")
+
+    if normalized == filepath.name:
         return True
-    if filepath.name == normalized:
+    if normalized == file_path or normalized == resolved_path:
         return True
+    if file_path.endswith("/" + normalized):
+        return True
+    if resolved_path.endswith("/" + normalized):
+        return True
+
     return False
 
 
