@@ -1,0 +1,16 @@
+[package]
+name = "ogtui"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ogtui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+crc32c = "0.6"
+prost = "0.13"
+ratatui = "0.29"
