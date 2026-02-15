@@ -1,0 +1,33 @@
+@startuml
+title OpenGraphs Agent Workflow (Alerts + Chat)
+
+start
+:Training process emits metrics/logs;
+:RunState is updated;
+
+if (Alert triggered?) then (yes)
+  :ContextBuilder builds focused context;
+  :ToolCaller (DSPy ReAct) gathers info;
+  :ActionPlanner parses DIAGNOSIS/ACTION/CODE_CHANGES;
+  
+  if (ACTION == refactor?) then (yes)
+    :CodeEditor (DSPy RLM) proposes unified diff if missing;
+    :GuardedExecutor creates checkpoint;
+    
+    if (auto_mode?) then (yes)
+      :Validate/apply diff to training file;
+      :Restart training process;
+    else (no)
+      :Return diagnosis only;
+    endif
+  else (no)
+    :Return diagnosis only;
+  endif
+  
+  :Append agent/system messages to chat history;
+else (no)
+  :Continue monitoring;
+endif
+
+stop
+@enduml

@@ -1,0 +1,48 @@
+@startuml
+title OpenGraphs Agent Sequence (TUI + Agent)
+
+actor User
+participant "TUI" as TUI
+participant "ogd/socket" as OGD
+participant "AgentEngine" as Agent
+participant "DSPy ReAct" as ReAct
+participant "DSPy RLM" as RLM
+participant "LLM Provider\n(OpenAI/Anthropic)" as LLM
+participant "Training Process" as Train
+participant "Filesystem" as FS
+
+Train -> OGD: metrics/logs/alerts
+OGD -> Agent: handle_alert(alert)
+Agent -> ReAct: run(context, question)
+ReAct -> LLM: tool + reasoning calls
+LLM --> ReAct: DIAGNOSIS/ACTION/CODE_CHANGES
+ReAct --> Agent: response
+
+alt ACTION == refactor
+  Agent -> RLM: propose_diff(context)
+  RLM -> LLM: llm_query / sub-calls
+  LLM --> RLM: unified diff
+  RLM --> Agent: diff
+  Agent -> FS: create_checkpoint
+  
+  alt auto_mode
+    Agent -> FS: apply_diff(training_file)
+    Agent -> Train: restart
+    Agent -> OGD: add system message
+  else manual
+    Agent -> OGD: add diagnosis only
+  end
+else ACTION == explain
+  Agent -> OGD: add diagnosis only
+end
+
+User -> TUI: send chat message
+TUI -> OGD: handle_chat_message
+OGD -> Agent: handle_chat_message(question)
+Agent -> ReAct: run(context, question)
+ReAct --> Agent: response
+Agent -> OGD: add agent message
+OGD -> TUI: chat history update
+TUI --> User: render chat tab
+
+@enduml
