@@ -57,6 +57,8 @@ pub struct App {
     pub total_events: usize,
     /// Total steps (max step value)
     pub max_step: i64,
+    /// Frame counter for animations (title scrolling)
+    pub tick_count: u64,
 }
 
 impl App {
@@ -84,6 +86,7 @@ impl App {
             metrics_cols: 4,
             total_events,
             max_step,
+            tick_count: 0,
         }
     }
 

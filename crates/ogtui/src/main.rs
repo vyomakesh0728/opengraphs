@@ -106,9 +106,16 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
     let mut layout = ui::LayoutRegions::default();
 
     loop {
+        app.tick_count = app.tick_count.wrapping_add(1);
+
         terminal.draw(|f| {
             layout = ui::draw(f, &mut app);
         })?;
+
+        // Poll with timeout so we get periodic redraws for title scroll animation
+        if !event::poll(std::time::Duration::from_millis(200))? {
+            continue;
+        }
 
         match event::read()? {
             Event::Key(key) => {

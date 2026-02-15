@@ -159,9 +159,20 @@ fn draw_metrics_grid(f: &mut Frame, app: &mut App, area: Rect, regions: &mut Lay
         .border_style(Style::default().fg(BORDER));
     let inner = temp_block.inner(area);
 
-    let card_width = (inner.width / 4).max(1);
-    let cols = (inner.width / card_width).max(1) as usize;
-    let card_height: u16 = 12;
+    // Calculate responsive grid dimensions based on available space
+    let min_card_width: u16 = 20;  // Minimum width for a card to be readable
+    let cols = (inner.width / min_card_width).max(1) as usize;
+    let card_width = inner.width / cols as u16;
+    let _ = card_width; // used implicitly by Constraint::Ratio below
+
+    // Card height: scale to show at least 2-3 rows, minimum 8 for readable charts
+    let card_height: u16 = if inner.height >= 36 {
+        12
+    } else if inner.height >= 24 {
+        (inner.height / 3).max(8)
+    } else {
+        (inner.height / 2).max(6)
+    };
     let rows_available = (inner.height / card_height).max(1) as usize;
     let total_rows = (app.tags.len() + cols - 1) / cols;
 
@@ -257,15 +268,27 @@ fn draw_metric_card(f: &mut Frame, app: &App, tag: &str, area: Rect, selected: b
         Style::default().fg(BORDER)
     };
 
-    // Shorten tag for display: show last path component if tag has slashes
+    // Shorten tag for display: marquee scroll when selected, static truncate otherwise
     let max_title_len = (area.width as usize).saturating_sub(4);
-    let short_tag = if tag.len() > max_title_len {
-        // Try to show the last segment after '/'
-        let last_seg = tag.rsplit('/').next().unwrap_or(tag);
-        if last_seg.len() <= max_title_len {
-            last_seg.to_string()
+    let display_tag = if tag.len() > max_title_len {
+        if selected {
+            // marquee: ping-pong scroll
+            let overflow = tag.len() - max_title_len;
+            // Each position holds for 1 tick; total cycle = 2 * overflow (ping-pong)
+            let cycle = (overflow * 2).max(1);
+            let pos = (app.tick_count as usize / 2) % cycle; // /2 to slow it down
+            let offset = if pos <= overflow { pos } else { cycle - pos };
+            // Slice carefully at char boundaries (ASCII tags are safe)
+            let end = (offset + max_title_len).min(tag.len());
+            tag[offset..end].to_string()
         } else {
-            format!("…{}", &last_seg[last_seg.len().saturating_sub(max_title_len.saturating_sub(1))..])
+            // Static: show last path segment
+            let last_seg = tag.rsplit('/').next().unwrap_or(tag);
+            if last_seg.len() <= max_title_len {
+                last_seg.to_string()
+            } else {
+                format!("…{}", &last_seg[last_seg.len().saturating_sub(max_title_len.saturating_sub(1))..])
+            }
         }
     } else {
         tag.to_string()
@@ -275,7 +298,7 @@ fn draw_metric_card(f: &mut Frame, app: &App, tag: &str, area: Rect, selected: b
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
         .title(Span::styled(
-            format!(" {} ", short_tag),
+            format!(" {} ", display_tag),
             title_style,
         ));
 
