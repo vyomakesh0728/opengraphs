@@ -400,7 +400,7 @@ fn run_app<B: Backend>(
 
     // Periodic polling state
     let mut last_poll = Instant::now();
-    let poll_interval = Duration::from_millis(2000);
+    let poll_interval = Duration::from_millis(500);
     let tick_rate = Duration::from_millis(100);
 
     // Initial daemon connection check
@@ -431,12 +431,19 @@ fn run_app<B: Backend>(
                     let prev_step = app.max_step;
                     let events_grew = updated.total_events > prev_events;
                     let step_changed = updated.max_step != prev_step;
-                    app.replace_data(
-                        updated.scalars,
-                        updated.log_lines,
-                        updated.total_events,
-                        updated.max_step,
-                    );
+                    let daemon_live_metrics_active = app.daemon_connected && app.live_logs_active;
+                    if daemon_live_metrics_active {
+                        // Keep daemon-fed metrics visible even when event-file refresh is empty.
+                        app.total_events = app.total_events.max(updated.total_events);
+                        app.max_step = app.max_step.max(updated.max_step);
+                    } else {
+                        app.replace_data(
+                            updated.scalars,
+                            updated.log_lines,
+                            updated.total_events,
+                            updated.max_step,
+                        );
+                    }
 
                     // Event-file refresh is also a live source (even when daemon is connected).
                     if !app.live_logs_active && (events_grew || step_changed) {
@@ -558,18 +565,39 @@ fn run_app<B: Backend>(
                         app.append_live_log(format!("[important] auto mode {}", state));
                     }
 
+                    if current_step < app.last_logged_step {
+                        // Training restarted; reset live points so the x-axis stays monotonic.
+                        app.scalars.clear();
+                        app.tags.clear();
+                        app.selected_metric = 0;
+                        app.focused_metric = None;
+                        app.metrics_scroll = 0;
+                        app.append_live_log(format!(
+                            "[info] step counter reset to {}",
+                            current_step
+                        ));
+                        app.last_logged_step = current_step;
+                        app.max_step = current_step;
+                    }
+
                     // Merge daemon metrics into TUI scalars
                     for (metric, values) in &metrics {
                         if let Some(arr) = values.as_array() {
-                            for val in arr {
+                            let total = arr.len() as i64;
+                            for (idx, val) in arr.iter().enumerate() {
                                 if let Some(v) = val.as_f64() {
-                                    let step = current_step as f64;
+                                    let offset = total.saturating_sub((idx as i64) + 1);
+                                    let inferred_step = current_step.saturating_sub(offset);
+                                    let step = inferred_step as f64;
                                     let entry = app.scalars.entry(metric.clone()).or_default();
-                                    // Avoid duplicate step values
-                                    if entry
-                                        .last()
-                                        .map_or(true, |last| (last.0 - step).abs() > 0.5)
-                                    {
+                                    if let Some(last) = entry.last_mut() {
+                                        if (last.0 - step).abs() < 0.5 {
+                                            // Refresh value for same step instead of duplicate point.
+                                            last.1 = v;
+                                        } else if step > last.0 {
+                                            entry.push((step, v));
+                                        }
+                                    } else {
                                         entry.push((step, v));
                                     }
                                 }
@@ -599,13 +627,7 @@ fn run_app<B: Backend>(
                     }
                     app.seen_alert_count = alerts.len();
 
-                    if current_step < app.last_logged_step {
-                        app.append_live_log(format!(
-                            "[info] step counter reset to {}",
-                            current_step
-                        ));
-                        app.last_logged_step = current_step;
-                    } else if current_step > app.last_logged_step {
+                    if current_step > app.last_logged_step {
                         let delta = current_step - app.last_logged_step;
                         app.append_live_log(format!(
                             "[sucess] step {} completed (+{})",

@@ -4,10 +4,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
-    widgets::{
-        Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, Paragraph, Tabs,
-        Wrap,
-    },
+    widgets::{Axis, Block, Borders, Chart, Clear, Dataset, GraphType, Paragraph, Tabs, Wrap},
 };
 
 use crate::app::{App, Tab};
@@ -447,7 +444,7 @@ fn style_for_log_line(line: &str) -> Style {
     Style::default().fg(TEXT_LIGHT)
 }
 
-fn draw_logs_tab(f: &mut Frame, app: &App, area: Rect) {
+fn draw_logs_tab(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(BORDER))
@@ -462,6 +459,11 @@ fn draw_logs_tab(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let inner = block.inner(area);
+    let viewport_rows = inner.height as usize;
+    app.set_logs_viewport_rows(viewport_rows);
+    let scroll_y = app.logs_scroll;
+
     let lines: Vec<Line> = app
         .log_lines
         .iter()
@@ -470,11 +472,6 @@ fn draw_logs_tab(f: &mut Frame, app: &App, area: Rect) {
             Line::from(Span::styled(line.as_str(), style))
         })
         .collect();
-
-    let inner = block.inner(area);
-    let viewport_rows = inner.height as usize;
-    let max_scroll = app.log_lines.len().saturating_sub(viewport_rows);
-    let scroll_y = (app.logs_scroll as usize).min(max_scroll) as u16;
 
     let paragraph = Paragraph::new(lines)
         .block(block)
@@ -490,7 +487,7 @@ const CHAT_AGENT: Color = Color::Rgb(96, 165, 250); // blue for agent
 const CHAT_SYSTEM: Color = Color::Rgb(107, 114, 128); // dim gray for system
 // reserved: const CHAT_INPUT_BG: Color = Color::Rgb(30, 35, 44);
 
-fn draw_chat_tab(f: &mut Frame, app: &App, area: Rect) {
+fn draw_chat_tab(f: &mut Frame, app: &mut App, area: Rect) {
     // Layout: banner (0-2) | messages (fill) | refactor prompt (0 or 3) | input (3) | status (1)
     let has_banner = app.auto_mode;
     let has_refactor = app.pending_refactor.is_some();
@@ -573,7 +570,7 @@ fn draw_chat_tab(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(status, chunks[4]);
 }
 
-fn draw_chat_messages(f: &mut Frame, app: &App, area: Rect) {
+fn draw_chat_messages(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(BORDER))
@@ -630,53 +627,52 @@ fn draw_chat_messages(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Render messages as a scrollable list
-    let items: Vec<ListItem> = app
-        .chat_messages
-        .iter()
-        .map(|msg| {
-            let (prefix, color) = match msg.sender.as_str() {
-                "user" => ("You", CHAT_USER),
-                "agent" => ("Agent", CHAT_AGENT),
-                "system" => ("System", CHAT_SYSTEM),
-                other => (other, TEXT_DIM),
+    let mut lines: Vec<Line> = Vec::new();
+    for msg in app.chat_messages.iter() {
+        let (prefix, color) = match msg.sender.as_str() {
+            "user" => ("You", CHAT_USER),
+            "agent" => ("Agent", CHAT_AGENT),
+            "system" => ("System", CHAT_SYSTEM),
+            other => (other, TEXT_DIM),
+        };
+
+        lines.push(Line::from(vec![Span::styled(
+            format!("[{}] ", prefix),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )]));
+
+        for l in msg.content.lines() {
+            let style = if l.starts_with('+') && !l.starts_with("+++") {
+                Style::default().fg(GREEN)
+            } else if l.starts_with('-') && !l.starts_with("---") {
+                Style::default().fg(Color::Red)
+            } else if l.starts_with("@@") {
+                Style::default().fg(Color::Cyan)
+            } else if l.starts_with("---") || l.starts_with("+++") {
+                Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT_LIGHT)
             };
+            lines.push(Line::from(Span::styled(format!("  {}", l), style)));
+        }
+        lines.push(Line::from(""));
+    }
 
-            // Wrap long messages into multiple lines
-            let header = Line::from(vec![Span::styled(
-                format!("[{}] ", prefix),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )]);
+    let viewport_rows = inner.height as usize;
+    let max_scroll = lines.len().saturating_sub(viewport_rows) as u16;
+    if app.chat_follow_tail {
+        app.chat_scroll = max_scroll;
+    } else if app.chat_scroll > max_scroll {
+        app.chat_scroll = max_scroll;
+    }
+    if app.chat_scroll >= max_scroll {
+        app.chat_follow_tail = true;
+    }
 
-            let content_lines: Vec<Line> = msg
-                .content
-                .lines()
-                .map(|l| {
-                    let style = if l.starts_with('+') && !l.starts_with("+++") {
-                        Style::default().fg(GREEN)
-                    } else if l.starts_with('-') && !l.starts_with("---") {
-                        Style::default().fg(Color::Red)
-                    } else if l.starts_with("@@") {
-                        Style::default().fg(Color::Cyan)
-                    } else if l.starts_with("---") || l.starts_with("+++") {
-                        Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(TEXT_LIGHT)
-                    };
-                    Line::from(Span::styled(format!("  {}", l), style))
-                })
-                .collect();
-
-            let mut all_lines = vec![header];
-            all_lines.extend(content_lines);
-            all_lines.push(Line::from("")); // spacing between messages
-
-            ListItem::new(all_lines)
-        })
-        .collect();
-
-    let list = List::new(items);
-    f.render_widget(list, inner);
+    let paragraph = Paragraph::new(lines)
+        .scroll((app.chat_scroll, 0))
+        .wrap(Wrap { trim: false });
+    f.render_widget(paragraph, inner);
 }
 
 fn draw_chat_input(f: &mut Frame, app: &App, area: Rect) {

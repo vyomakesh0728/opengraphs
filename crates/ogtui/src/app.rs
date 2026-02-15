@@ -46,6 +46,10 @@ pub struct App {
     pub events_path: PathBuf,
     /// Scroll offset in the logs tab
     pub logs_scroll: u16,
+    /// Whether logs should auto-follow incoming lines
+    pub logs_follow_tail: bool,
+    /// Number of visible rows in the logs viewport (set by UI)
+    pub logs_viewport_rows: usize,
     /// Whether the app should quit
     pub should_quit: bool,
     /// Selected metric index for highlight
@@ -70,6 +74,8 @@ pub struct App {
     pub chat_input: String,
     /// Scroll offset in the chat message list
     pub chat_scroll: u16,
+    /// Whether chat should auto-follow incoming messages
+    pub chat_follow_tail: bool,
     /// Whether the chat input is focused (typing mode)
     pub chat_input_focused: bool,
     /// Whether the agent is currently processing
@@ -114,6 +120,8 @@ impl App {
             show_help: false,
             events_path,
             logs_scroll: 0,
+            logs_follow_tail: true,
+            logs_viewport_rows: 1,
             should_quit: false,
             selected_metric: 0,
             focused_metric: None,
@@ -125,6 +133,7 @@ impl App {
             chat_messages: Vec::new(),
             chat_input: String::new(),
             chat_scroll: 0,
+            chat_follow_tail: true,
             chat_input_focused: false,
             agent_thinking: false,
             daemon_connected: false,
@@ -183,9 +192,10 @@ impl App {
         }
 
         self.ensure_metric_visible();
-        let max_logs_scroll = self.log_lines.len().saturating_sub(1) as u16;
-        if self.logs_scroll > max_logs_scroll {
-            self.logs_scroll = max_logs_scroll;
+        if self.logs_follow_tail {
+            self.logs_scroll = self.logs_max_scroll();
+        } else {
+            self.clamp_logs_scroll();
         }
     }
 
@@ -198,14 +208,19 @@ impl App {
             "-- live run log --".to_string(),
             "[info] listening to live daemon updates".to_string(),
         ];
-        self.logs_scroll = self.log_lines.len().saturating_sub(1) as u16;
+        self.logs_follow_tail = true;
+        self.logs_scroll = self.logs_max_scroll();
         self.last_daemon_log_tail.clear();
         self.seen_alert_count = 0;
     }
 
     pub fn append_live_log(&mut self, line: impl Into<String>) {
         self.log_lines.push(line.into());
-        self.logs_scroll = self.log_lines.len().saturating_sub(1) as u16;
+        if self.logs_follow_tail {
+            self.logs_scroll = self.logs_max_scroll();
+        } else {
+            self.clamp_logs_scroll();
+        }
     }
 
     pub fn toggle_help(&mut self) {
@@ -213,12 +228,38 @@ impl App {
     }
 
     pub fn scroll_logs_down(&mut self) {
-        let max = self.log_lines.len().saturating_sub(1) as u16;
+        let max = self.logs_max_scroll();
         self.logs_scroll = (self.logs_scroll + 1).min(max);
+        if self.logs_scroll >= max {
+            self.logs_follow_tail = true;
+        }
     }
 
     pub fn scroll_logs_up(&mut self) {
+        self.logs_follow_tail = false;
         self.logs_scroll = self.logs_scroll.saturating_sub(1);
+    }
+
+    pub fn set_logs_viewport_rows(&mut self, rows: usize) {
+        self.logs_viewport_rows = rows.max(1);
+        if self.logs_follow_tail {
+            self.logs_scroll = self.logs_max_scroll();
+        } else {
+            self.clamp_logs_scroll();
+        }
+    }
+
+    fn logs_max_scroll(&self) -> u16 {
+        self.log_lines
+            .len()
+            .saturating_sub(self.logs_viewport_rows.max(1)) as u16
+    }
+
+    fn clamp_logs_scroll(&mut self) {
+        let max_scroll = self.logs_max_scroll();
+        if self.logs_scroll > max_scroll {
+            self.logs_scroll = max_scroll;
+        }
     }
 
     pub fn next_metric(&mut self) {
@@ -303,20 +344,19 @@ impl App {
     }
 
     pub fn scroll_chat_down(&mut self) {
-        let max = self.chat_messages.len().saturating_sub(1) as u16;
-        self.chat_scroll = (self.chat_scroll + 1).min(max);
+        self.chat_scroll = self.chat_scroll.saturating_add(1);
     }
 
     pub fn scroll_chat_up(&mut self) {
+        self.chat_follow_tail = false;
         self.chat_scroll = self.chat_scroll.saturating_sub(1);
     }
 
     pub fn update_chat_messages(&mut self, messages: Vec<ChatMessage>) {
         self.chat_messages = messages;
-        // Auto-scroll to bottom
-        let len = self.chat_messages.len();
-        if len > 0 {
-            self.chat_scroll = len.saturating_sub(1) as u16;
+        if self.chat_follow_tail {
+            // Clamp to bottom during render once wrapped line count is known.
+            self.chat_scroll = u16::MAX;
         }
     }
 }
