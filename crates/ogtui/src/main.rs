@@ -47,58 +47,17 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // ── Parse TF events ─────────────────────────────────────────────────
-    let scalars = tfevents::load_scalars(&cli.path)
+    // ── Parse TF events via incremental reader ───────────────────────────
+    let reader = tfevents::IncrementalReader::new(&cli.path)
         .with_context(|| format!("loading events from {}", cli.path.display()))?;
 
-    // Build log lines from scalar events
-    let all_events = if cli.path.is_file() {
-        tfevents::parse_events_file(&cli.path)?
-    } else {
-        // Re-parse to get the log lines ordered by step
-        let mut evts = Vec::new();
-        if cli.path.is_dir() {
-            for entry in std::fs::read_dir(&cli.path).into_iter().flatten() {
-                if let Ok(entry) = entry {
-                    let p = entry.path();
-                    if p.is_dir() {
-                        // Look inside subdirectory
-                        for sub in std::fs::read_dir(&p).into_iter().flatten() {
-                            if let Ok(sub) = sub {
-                                let sp = sub.path();
-                                if sp.file_name().unwrap_or_default().to_string_lossy().contains("tfevents") {
-                                    if let Ok(e) = tfevents::parse_events_file(&sp) {
-                                        evts.extend(e);
-                                    }
-                                }
-                            }
-                        }
-                    } else if p.file_name().unwrap_or_default().to_string_lossy().contains("tfevents") {
-                        if let Ok(e) = tfevents::parse_events_file(&p) {
-                            evts.extend(e);
-                        }
-                    }
-                }
-            }
-        }
-        evts
-    };
-
-    let total_events = all_events.len();
-    let max_step = all_events.iter().map(|e| e.step).max().unwrap_or(0);
-
-    // Build log lines
-    let mut log_lines = vec!["-- parsed events log --".to_string(), String::new()];
-    let mut sorted_events = all_events;
-    sorted_events.sort_by_key(|e| e.step);
-    for ev in &sorted_events {
-        log_lines.push(format!(
-            "step {:>6} │ {:<30} │ {:.6}",
-            ev.step, ev.tag, ev.value
-        ));
-    }
-
-    let mut app = App::new(scalars, log_lines, cli.path.clone(), total_events, max_step);
+    let mut app = App::new(
+        reader.scalars.clone(),
+        reader.log_lines.clone(),
+        cli.path.clone(),
+        reader.total_events,
+        reader.max_step,
+    );
 
     // Override socket path if provided
     if let Some(ref sock) = cli.socket {
@@ -126,7 +85,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, app);
+    let result = run_app(&mut terminal, app, reader);
 
     // ── Restore terminal ────────────────────────────────────────────────
     disable_raw_mode()?;
@@ -153,7 +112,6 @@ fn spawn_daemon(
     auto_mode: bool,
     socket_path: &PathBuf,
 ) -> Result<Child> {
-    // Try python3 first, then python
     let python = find_python();
 
     let mut cmd = Command::new(&python);
@@ -218,7 +176,7 @@ enum BgMessage {
     },
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
+fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App, mut reader: tfevents::IncrementalReader) -> Result<()> {
     // Track layout regions for mouse hit-testing
     let mut layout = ui::LayoutRegions::default();
 
@@ -228,7 +186,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
     // Periodic polling state
     let mut last_poll = Instant::now();
     let poll_interval = Duration::from_millis(2000);
-    let tick_rate = Duration::from_millis(100);
+    let tick_rate = Duration::from_millis(200);
 
     // Initial daemon connection check
     {
@@ -250,10 +208,25 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
         });
     }
 
+    // Poll for new tfevents data every ~3 seconds (15 ticks × 200ms)
+    const TFEVENTS_POLL_INTERVAL: u64 = 15;
+
     loop {
-        terminal.draw(|f| {
-            layout = ui::draw(f, &mut app);
-        })?;
+        app.tick_count = app.tick_count.wrapping_add(1);
+
+        // Periodically check for new data from tfevents files
+        if app.tick_count % TFEVENTS_POLL_INTERVAL == 0 {
+            if let Ok(true) = reader.poll() {
+                // New data found — update app state
+                let new_tags: Vec<String> = reader.scalars.keys().cloned().collect();
+                app.scalars = reader.scalars.clone();
+                app.tags = new_tags;
+                app.run_names = reader.run_names.clone();
+                app.log_lines = reader.log_lines.clone();
+                app.total_events = reader.total_events;
+                app.max_step = reader.max_step;
+            }
+        }
 
         // Drain background messages
         while let Ok(msg) = bg_rx.try_recv() {
@@ -272,7 +245,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                 BgMessage::ChatSendResult { plan, messages } => {
                     app.agent_thinking = false;
                     app.update_chat_messages(messages);
-                    // Store pending refactor if agent proposed code changes (non-auto)
                     if plan.action == "refactor" && !plan.code_changes.is_empty() && !app.auto_mode {
                         app.pending_refactor = Some(plan);
                         app.chat_status = "Refactor proposed — press y to apply, n to reject".to_string();
@@ -302,16 +274,20 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                     app.chat_status = format!("Refactor error: {}", err);
                 }
                 BgMessage::LiveMetrics { metrics, logs, current_step } => {
-                    // Merge daemon metrics into TUI scalars
+                    // Merge daemon metrics into TUI scalars (under "daemon" run)
                     for (metric, values) in &metrics {
                         if let Some(arr) = values.as_array() {
                             for val in arr {
                                 if let Some(v) = val.as_f64() {
                                     let step = current_step as f64;
-                                    let entry = app.scalars.entry(metric.clone()).or_default();
+                                    let run_entry = app.scalars
+                                        .entry(metric.clone())
+                                        .or_default()
+                                        .entry("daemon".to_string())
+                                        .or_default();
                                     // Avoid duplicate step values
-                                    if entry.last().map_or(true, |last| (last.0 - step).abs() > 0.5) {
-                                        entry.push((step, v));
+                                    if run_entry.last().map_or(true, |last| (last.0 - step).abs() > 0.5) {
+                                        run_entry.push((step, v));
                                     }
                                 }
                             }
@@ -322,7 +298,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                     // Merge daemon logs
                     if !logs.is_empty() {
                         let daemon_log_marker = "[daemon]";
-                        // Only add new daemon log lines
                         let existing_daemon_count = app.log_lines.iter()
                             .filter(|l| l.starts_with(daemon_log_marker))
                             .count();
@@ -366,7 +341,11 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
             });
         }
 
-        // Poll for events with timeout so we can process bg messages
+        terminal.draw(|f| {
+            layout = ui::draw(f, &mut app);
+        })?;
+
+        // Poll for events with timeout so we can process bg messages + animations
         if !event::poll(tick_rate)? {
             continue;
         }
@@ -546,7 +525,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                         }
 
                         // Click on metric cards: select, then focus if already selected
-                        // Card rects are indexed from 0 but correspond to scrolled indices
                         let scroll_offset = app.metrics_scroll * app.metrics_cols;
                         for (vis_i, card_rect) in layout.metric_card_rects.iter().enumerate() {
                             if x >= card_rect.x
@@ -556,7 +534,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                             {
                                 let actual_idx = scroll_offset + vis_i;
                                 if app.selected_metric == actual_idx {
-                                    // Already selected → focus (enlarge)
                                     app.focus_metric(actual_idx);
                                 } else {
                                     app.selected_metric = actual_idx;

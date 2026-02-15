@@ -34,10 +34,12 @@ impl Tab {
 /// Application state.
 pub struct App {
     pub active_tab: Tab,
-    /// tag → sorted (step, value) pairs
-    pub scalars: BTreeMap<String, Vec<(f64, f64)>>,
+    /// tag → { run_name → sorted (step, value) pairs }
+    pub scalars: BTreeMap<String, BTreeMap<String, Vec<(f64, f64)>>>,
     /// Ordered list of tag names for grid iteration
     pub tags: Vec<String>,
+    /// Ordered list of run names for color assignment
+    pub run_names: Vec<String>,
     /// Log lines derived from events
     pub log_lines: Vec<String>,
     /// Whether the help overlay is shown
@@ -62,6 +64,8 @@ pub struct App {
     pub total_events: usize,
     /// Total steps (max step value)
     pub max_step: i64,
+    /// Frame counter for animations (title scrolling)
+    pub tick_count: u64,
 
     // ── Agent chat state ─────────────────────────────────────────────────
     /// Chat messages from the daemon
@@ -88,18 +92,27 @@ pub struct App {
 
 impl App {
     pub fn new(
-        scalars: BTreeMap<String, Vec<(f64, f64)>>,
+        scalars: BTreeMap<String, BTreeMap<String, Vec<(f64, f64)>>>,
         log_lines: Vec<String>,
         events_path: PathBuf,
         total_events: usize,
         max_step: i64,
     ) -> Self {
         let tags: Vec<String> = scalars.keys().cloned().collect();
+        // Collect all unique run names across all tags
+        let mut run_set = std::collections::BTreeSet::new();
+        for runs in scalars.values() {
+            for run_name in runs.keys() {
+                run_set.insert(run_name.clone());
+            }
+        }
+        let run_names: Vec<String> = run_set.into_iter().collect();
         let daemon_socket = crate::socket_client::socket_path();
         Self {
             active_tab: Tab::Graphs,
             scalars,
             tags,
+            run_names,
             log_lines,
             show_help: false,
             events_path,
@@ -112,6 +125,7 @@ impl App {
             metrics_cols: 4,
             total_events,
             max_step,
+            tick_count: 0,
             chat_messages: Vec::new(),
             chat_input: String::new(),
             chat_scroll: 0,
