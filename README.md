@@ -51,6 +51,38 @@ The TUI has a built-in **chat** tab that connects to the Python agent daemon via
 - **DSPy RLM** for codebase exploration and code editing
 - **`--auto` mode**: agent applies unified diffs to your training script and restarts training
 - **Checkpoint/rollback**: every refactor is checkpointed; failures auto-rollback
+## Live training metrics (single terminal)
+
+```bash
+cd /home/ubuntu/opengraphs
+RUN_DIR="/tmp/og-live-$(date +%s)"
+rm -f /tmp/opengraphs-ogd.sock
+PATH="$PWD/.venv/bin:$HOME/.local/bin:$PATH" \
+PYTHONPATH="$PWD/python/agent-chat" \
+./target/debug/ogtui \
+  --path "$RUN_DIR" \
+  --refresh-ms 100 \
+  --training-file /home/ubuntu/modded-nanogpt/train_gpt_demo50.py \
+  --codebase-root /home/ubuntu/modded-nanogpt \
+  --training-cmd "torchrun --standalone --nproc_per_node=8 train_gpt_demo50.py" \
+  --start-training \
+  --fresh-run \
+  --auto
+```
+
+Optional env vars for TensorBoard logging:
+
+```bash
+TB_LOG_DIR=runs/       # default: runs/
+TB_LOG_EVERY=10        # cheap metrics interval
+TB_LOG_HEAVY_EVERY=50  # expensive metrics interval
+```
+
+If you only want the current run (and not older eval/event files), pass that run directory directly:
+
+```bash
+cargo run -p ogtui -- --path runs/<current-run-id>
+```
 
 ## Stars graph
 

@@ -5,21 +5,24 @@ use ratatui::{
     symbols,
     text::{Line, Span},
     widgets::{
-        Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem,
-        Paragraph, Tabs, Wrap,
+        Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, Paragraph, Tabs,
+        Wrap,
     },
 };
 
 use crate::app::{App, Tab};
 
 // ── Colors (matching the TypeScript TUI) ────────────────────────────────────
-const GREEN: Color = Color::Rgb(46, 204, 113);   // #2ecc71
-const BORDER: Color = Color::Rgb(107, 114, 128);  // #6b7280
+const GREEN: Color = Color::Rgb(46, 204, 113); // #2ecc71
+const BORDER: Color = Color::Rgb(107, 114, 128); // #6b7280
 const TEXT_DIM: Color = Color::Rgb(155, 163, 175); // #9BA3AF
 const TEXT_LIGHT: Color = Color::Rgb(209, 213, 219); // #d1d5db
-const BG_DARK: Color = Color::Rgb(13, 17, 23);    // #0d1117
+const BG_DARK: Color = Color::Rgb(13, 17, 23); // #0d1117
 const CHART_RAW: Color = Color::Rgb(100, 149, 237); // cornflower blue for raw data
 const CHART_SMOOTH: Color = Color::Rgb(255, 165, 0); // orange for smoothed
+const LOG_INFO_ASH: Color = Color::Rgb(148, 163, 184); // ash
+const LOG_ERROR: Color = Color::Rgb(248, 113, 113); // bright red
+const LOG_IMPORTANT: Color = Color::Rgb(251, 191, 36); // bright amber
 
 /// Clickable regions tracked for mouse hit-testing.
 #[derive(Default, Clone)]
@@ -39,7 +42,7 @@ pub fn draw(f: &mut Frame, app: &mut App) -> LayoutRegions {
     let root_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header tabs
+            Constraint::Length(3), // header tabs
             Constraint::Min(10),   // body
             Constraint::Length(1), // footer
         ])
@@ -75,7 +78,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, regions: &mut LayoutRegions
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(30), // tabs
-            Constraint::Min(20),   // step progress / info
+            Constraint::Min(20),    // step progress / info
         ])
         .split(area);
 
@@ -87,7 +90,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, regions: &mut LayoutRegions
     let inner_w = tabs_outer.width.saturating_sub(2); // minus both borders
     let tab_count = Tab::ALL.len();
     let divider_w: u16 = 1; // "│"
-    let padding: u16 = 1;   // ratatui Tabs default padding per side
+    let padding: u16 = 1; // ratatui Tabs default padding per side
     {
         let mut cur_x = inner_x;
         regions.tab_rects.clear();
@@ -100,12 +103,9 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, regions: &mut LayoutRegions
                 // last tab: extend to fill remaining inner space
                 (inner_x + inner_w).saturating_sub(cur_x)
             };
-            regions.tab_rects.push(Rect::new(
-                cur_x,
-                tabs_outer.y,
-                full_w,
-                tabs_outer.height,
-            ));
+            regions
+                .tab_rects
+                .push(Rect::new(cur_x, tabs_outer.y, full_w, tabs_outer.height));
             cur_x += full_w;
         }
     }
@@ -155,10 +155,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, regions: &mut LayoutRegions
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(BORDER))
-            .title(Span::styled(
-                " step progress ",
-                Style::default().fg(BORDER),
-            )),
+            .title(Span::styled(" step progress ", Style::default().fg(BORDER))),
     );
     f.render_widget(step_block, header_chunks[1]);
 }
@@ -289,7 +286,12 @@ fn draw_metric_card(f: &mut Frame, app: &App, tag: &str, area: Rect, selected: b
         if last_seg.len() <= max_title_len {
             last_seg.to_string()
         } else {
-            format!("…{}", &last_seg[last_seg.len().saturating_sub(max_title_len.saturating_sub(1))..])
+            format!(
+                "…{}",
+                &last_seg[last_seg
+                    .len()
+                    .saturating_sub(max_title_len.saturating_sub(1))..]
+            )
         }
     } else {
         tag.to_string()
@@ -298,10 +300,7 @@ fn draw_metric_card(f: &mut Frame, app: &App, tag: &str, area: Rect, selected: b
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            format!(" {} ", short_tag),
-            title_style,
-        ));
+        .title(Span::styled(format!(" {} ", short_tag), title_style));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -373,7 +372,9 @@ fn draw_metric_card(f: &mut Frame, app: &App, tag: &str, area: Rect, selected: b
         // Value label
         let val_label = Paragraph::new(Line::from(Span::styled(
             latest_text,
-            Style::default().fg(CHART_SMOOTH).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(CHART_SMOOTH)
+                .add_modifier(Modifier::BOLD),
         )))
         .alignment(Alignment::Right);
         f.render_widget(val_label, value_area);
@@ -421,6 +422,31 @@ fn draw_stats_panel(f: &mut Frame, app: &App, area: Rect) {
 
 // ── Logs Tab ────────────────────────────────────────────────────────────────
 
+fn style_for_log_line(line: &str) -> Style {
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+
+    if lower.starts_with("[error]") {
+        return Style::default().fg(LOG_ERROR).add_modifier(Modifier::BOLD);
+    }
+    if lower.starts_with("[sucess]") || lower.starts_with("[success]") {
+        return Style::default().fg(GREEN).add_modifier(Modifier::BOLD);
+    }
+    if lower.starts_with("[important]") {
+        return Style::default()
+            .fg(LOG_IMPORTANT)
+            .add_modifier(Modifier::BOLD);
+    }
+    if lower.starts_with("[info]") {
+        return Style::default().fg(LOG_INFO_ASH);
+    }
+    if trimmed.starts_with("--") {
+        return Style::default().fg(BORDER);
+    }
+
+    Style::default().fg(TEXT_LIGHT)
+}
+
 fn draw_logs_tab(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -436,28 +462,31 @@ fn draw_logs_tab(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let items: Vec<ListItem> = app
+    let lines: Vec<Line> = app
         .log_lines
         .iter()
-        .enumerate()
-        .map(|(i, line)| {
-            let style = if i == 0 {
-                Style::default().fg(BORDER)
-            } else {
-                Style::default().fg(TEXT_LIGHT)
-            };
-            ListItem::new(Line::from(Span::styled(line.as_str(), style)))
+        .map(|line| {
+            let style = style_for_log_line(line);
+            Line::from(Span::styled(line.as_str(), style))
         })
         .collect();
 
-    let list = List::new(items).block(block);
-    f.render_widget(list, area);
+    let inner = block.inner(area);
+    let viewport_rows = inner.height as usize;
+    let max_scroll = app.log_lines.len().saturating_sub(viewport_rows);
+    let scroll_y = (app.logs_scroll as usize).min(max_scroll) as u16;
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .scroll((scroll_y, 0))
+        .wrap(Wrap { trim: false });
+    f.render_widget(paragraph, area);
 }
 
 // ── Chat Tab ────────────────────────────────────────────────────────────
 
-const CHAT_USER: Color = Color::Rgb(52, 211, 153);    // emerald for user
-const CHAT_AGENT: Color = Color::Rgb(96, 165, 250);   // blue for agent
+const CHAT_USER: Color = Color::Rgb(52, 211, 153); // emerald for user
+const CHAT_AGENT: Color = Color::Rgb(96, 165, 250); // blue for agent
 const CHAT_SYSTEM: Color = Color::Rgb(107, 114, 128); // dim gray for system
 // reserved: const CHAT_INPUT_BG: Color = Color::Rgb(30, 35, 44);
 
@@ -482,7 +511,9 @@ fn draw_chat_tab(f: &mut Frame, app: &App, area: Rect) {
     if app.auto_mode {
         let banner = Paragraph::new(Line::from(Span::styled(
             " ⚡ Auto mode: Agent will apply fixes automatically ",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )))
         .alignment(Alignment::Center);
         f.render_widget(banner, chunks[0]);
@@ -498,13 +529,18 @@ fn draw_chat_tab(f: &mut Frame, app: &App, area: Rect) {
             .border_style(Style::default().fg(Color::Yellow))
             .title(Span::styled(
                 " pending refactor ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ));
         let prompt = Paragraph::new(Line::from(vec![
             Span::styled(" Press ", Style::default().fg(TEXT_LIGHT)),
             Span::styled("y", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
             Span::styled(" to apply │ ", Style::default().fg(TEXT_LIGHT)),
-            Span::styled("n", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "n",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" to reject", Style::default().fg(TEXT_LIGHT)),
         ]))
         .block(refactor_block);
@@ -522,7 +558,11 @@ fn draw_chat_tab(f: &mut Frame, app: &App, area: Rect) {
     } else {
         Style::default().fg(Color::Red)
     };
-    let thinking_indicator = if app.agent_thinking { " 🔄 thinking..." } else { "" };
+    let thinking_indicator = if app.agent_thinking {
+        " 🔄 thinking..."
+    } else {
+        ""
+    };
     let status_text = format!(
         " {} │ {}{}",
         app.chat_status,
@@ -537,7 +577,10 @@ fn draw_chat_messages(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(BORDER))
-        .title(Span::styled(" agent chat ", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " agent chat ",
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+        ));
 
     if app.chat_messages.is_empty() && !app.daemon_connected {
         let help_lines = vec![
@@ -600,12 +643,10 @@ fn draw_chat_messages(f: &mut Frame, app: &App, area: Rect) {
             };
 
             // Wrap long messages into multiple lines
-            let header = Line::from(vec![
-                Span::styled(
-                    format!("[{}] ", prefix),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-            ]);
+            let header = Line::from(vec![Span::styled(
+                format!("[{}] ", prefix),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )]);
 
             let content_lines: Vec<Line> = msg
                 .content
@@ -639,7 +680,11 @@ fn draw_chat_messages(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_chat_input(f: &mut Frame, app: &App, area: Rect) {
-    let border_color = if app.chat_input_focused { GREEN } else { BORDER };
+    let border_color = if app.chat_input_focused {
+        GREEN
+    } else {
+        BORDER
+    };
     let title = if app.chat_input_focused {
         " type message (Enter=send, Esc=unfocus) "
     } else {
@@ -686,6 +731,7 @@ fn draw_help_modal(f: &mut Frame, area: Rect) {
         ("Tab / Shift+Tab", "Cycle tabs"),
         ("q", "Quit"),
         ("?", "Toggle this help"),
+        ("F6", "Toggle copy mode (highlight/copy text with mouse)"),
         ("Esc", "Close help / exit detail"),
         ("j / ↓", "Scroll logs/chat down"),
         ("k / ↑", "Scroll logs/chat up"),
@@ -721,13 +767,31 @@ fn draw_help_modal(f: &mut Frame, area: Rect) {
         ))
         .style(Style::default().bg(BG_DARK));
 
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(paragraph, modal_area);
 }
 
 // ── Footer ──────────────────────────────────────────────────────────────────
 
 fn draw_footer(f: &mut Frame, _app: &App, area: Rect) {
+    if _app.copy_mode {
+        let banner = Line::from(vec![
+            Span::styled(
+                "COPY MODE",
+                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " │ Drag mouse to highlight/copy text │ F6 resume interactive mode",
+                Style::default().fg(TEXT_LIGHT),
+            ),
+        ]);
+        let footer = Paragraph::new(banner).alignment(Alignment::Left);
+        f.render_widget(footer, area);
+        return;
+    }
+
     let hints = if _app.active_tab == Tab::Chat {
         Line::from(vec![
             Span::styled("Tab", Style::default().fg(GREEN)),
@@ -738,6 +802,8 @@ fn draw_footer(f: &mut Frame, _app: &App, area: Rect) {
             Span::styled(" send │ ", Style::default().fg(BORDER)),
             Span::styled("j/k", Style::default().fg(GREEN)),
             Span::styled(" scroll │ ", Style::default().fg(BORDER)),
+            Span::styled("F6", Style::default().fg(GREEN)),
+            Span::styled(" copy │ ", Style::default().fg(BORDER)),
             Span::styled("?", Style::default().fg(GREEN)),
             Span::styled(" help │ ", Style::default().fg(BORDER)),
             Span::styled("q", Style::default().fg(GREEN)),
@@ -756,7 +822,9 @@ fn draw_footer(f: &mut Frame, _app: &App, area: Rect) {
             Span::styled("h/l", Style::default().fg(GREEN)),
             Span::styled(" metrics │ ", Style::default().fg(BORDER)),
             Span::styled("j/k", Style::default().fg(GREEN)),
-            Span::styled(" scroll", Style::default().fg(BORDER)),
+            Span::styled(" scroll │ ", Style::default().fg(BORDER)),
+            Span::styled("F6", Style::default().fg(GREEN)),
+            Span::styled(" copy", Style::default().fg(BORDER)),
             Span::raw("    "),
             Span::styled("opengraphs", Style::default().fg(BORDER)),
         ])
@@ -784,8 +852,7 @@ fn draw_focused_metric(f: &mut Frame, app: &App, metric_idx: usize, area: Rect) 
     let tag = match app.tags.get(metric_idx) {
         Some(t) => t.as_str(),
         None => {
-            let p = Paragraph::new("Invalid metric index")
-                .style(Style::default().fg(TEXT_DIM));
+            let p = Paragraph::new("Invalid metric index").style(Style::default().fg(TEXT_DIM));
             f.render_widget(p, area);
             return;
         }
@@ -801,7 +868,9 @@ fn draw_focused_metric(f: &mut Frame, app: &App, metric_idx: usize, area: Rect) 
                     format!(" {} ", tag),
                     Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
                 ));
-            let p = Paragraph::new("No data").style(Style::default().fg(TEXT_DIM)).block(block);
+            let p = Paragraph::new("No data")
+                .style(Style::default().fg(TEXT_DIM))
+                .block(block);
             f.render_widget(p, area);
             return;
         }
@@ -814,7 +883,11 @@ fn draw_focused_metric(f: &mut Frame, app: &App, metric_idx: usize, area: Rect) 
     let y_max = data.iter().map(|d| d.1).fold(f64::NEG_INFINITY, f64::max);
     let y_margin = (y_max - y_min).abs() * 0.05;
     let y_lo = y_min - y_margin;
-    let y_hi = if (y_max - y_min).abs() < 1e-12 { y_max + 1.0 } else { y_max + y_margin };
+    let y_hi = if (y_max - y_min).abs() < 1e-12 {
+        y_max + 1.0
+    } else {
+        y_max + y_margin
+    };
     let latest = data.last().unwrap().1;
     let count = data.len();
 

@@ -86,14 +86,9 @@ fn send_request(payload: &Value, sock_path: &Path) -> Result<Value, ClientError>
         return Err(ClientError::SocketNotFound(sock_path.to_path_buf()));
     }
 
-    let mut stream = UnixStream::connect(sock_path)
-        .map_err(ClientError::ConnectionFailed)?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .ok();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .ok();
+    let mut stream = UnixStream::connect(sock_path).map_err(ClientError::ConnectionFailed)?;
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
     let mut msg = serde_json::to_string(payload).unwrap();
     msg.push('\n');
@@ -136,8 +131,8 @@ pub fn get_chat_history(sock_path: &Path) -> Result<Vec<ChatMessage>, ClientErro
         .get("chat_history")
         .cloned()
         .unwrap_or(Value::Array(vec![]));
-    let messages: Vec<ChatMessage> = serde_json::from_value(history)
-        .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+    let messages: Vec<ChatMessage> =
+        serde_json::from_value(history).map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
     Ok(messages)
 }
 
@@ -185,7 +180,10 @@ pub fn apply_refactor(
         sock_path,
     )?;
 
-    let success = resp.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let success = resp
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let history_val = resp
         .get("chat_history")
         .cloned()
@@ -208,6 +206,5 @@ pub fn get_run_state(sock_path: &Path) -> Result<RunStateResponse, ClientError> 
         .cloned()
         .ok_or_else(|| ClientError::InvalidResponse("missing run_state".into()))?;
 
-    serde_json::from_value(run_state)
-        .map_err(|e| ClientError::InvalidResponse(e.to_string()))
+    serde_json::from_value(run_state).map_err(|e| ClientError::InvalidResponse(e.to_string()))
 }

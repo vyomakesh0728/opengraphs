@@ -6,13 +6,13 @@ mod ui;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind, MouseButton},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::prelude::*;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -31,6 +31,18 @@ struct Cli {
     #[arg(short = 'f', long)]
     training_file: Option<PathBuf>,
 
+    /// Command used to launch training (e.g. "torchrun --standalone --nproc_per_node=1 train_gpt.py")
+    #[arg(long)]
+    training_cmd: Option<String>,
+
+    /// Start the training process automatically when daemon starts
+    #[arg(long)]
+    start_training: bool,
+
+    /// Delete existing TensorBoard event files under --path before auto-start
+    #[arg(long)]
+    fresh_run: bool,
+
     /// Codebase root for agent indexing (default: current dir)
     #[arg(long, default_value = ".")]
     codebase_root: PathBuf,
@@ -42,55 +54,29 @@ struct Cli {
     /// Unix socket path for daemon communication
     #[arg(long, env = "OGD_SOCKET")]
     socket: Option<PathBuf>,
+
+    /// Refresh interval for live reload in milliseconds (0 disables live reload)
+    #[arg(long, default_value_t = 1000)]
+    refresh_ms: u64,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+struct ViewData {
+    scalars: std::collections::BTreeMap<String, Vec<(f64, f64)>>,
+    log_lines: Vec<String>,
+    total_events: usize,
+    max_step: i64,
+}
 
-    // ── Parse TF events ─────────────────────────────────────────────────
-    let scalars = tfevents::load_scalars(&cli.path)
-        .with_context(|| format!("loading events from {}", cli.path.display()))?;
+fn load_view_data(path: &Path) -> Result<ViewData> {
+    let loaded = tfevents::load_run(path)
+        .with_context(|| format!("loading events from {}", path.display()))?;
 
-    // Build log lines from scalar events
-    let all_events = if cli.path.is_file() {
-        tfevents::parse_events_file(&cli.path)?
-    } else {
-        // Re-parse to get the log lines ordered by step
-        let mut evts = Vec::new();
-        if cli.path.is_dir() {
-            for entry in std::fs::read_dir(&cli.path).into_iter().flatten() {
-                if let Ok(entry) = entry {
-                    let p = entry.path();
-                    if p.is_dir() {
-                        // Look inside subdirectory
-                        for sub in std::fs::read_dir(&p).into_iter().flatten() {
-                            if let Ok(sub) = sub {
-                                let sp = sub.path();
-                                if sp.file_name().unwrap_or_default().to_string_lossy().contains("tfevents") {
-                                    if let Ok(e) = tfevents::parse_events_file(&sp) {
-                                        evts.extend(e);
-                                    }
-                                }
-                            }
-                        }
-                    } else if p.file_name().unwrap_or_default().to_string_lossy().contains("tfevents") {
-                        if let Ok(e) = tfevents::parse_events_file(&p) {
-                            evts.extend(e);
-                        }
-                    }
-                }
-            }
-        }
-        evts
-    };
-
-    let total_events = all_events.len();
-    let max_step = all_events.iter().map(|e| e.step).max().unwrap_or(0);
-
-    // Build log lines
-    let mut log_lines = vec!["-- parsed events log --".to_string(), String::new()];
-    let mut sorted_events = all_events;
+    let mut sorted_events = loaded.events;
     sorted_events.sort_by_key(|e| e.step);
+    let total_events = sorted_events.len();
+    let max_step = sorted_events.iter().map(|e| e.step).max().unwrap_or(0);
+
+    let mut log_lines = vec!["-- parsed events log --".to_string(), String::new()];
     for ev in &sorted_events {
         log_lines.push(format!(
             "step {:>6} │ {:<30} │ {:.6}",
@@ -98,7 +84,25 @@ fn main() -> Result<()> {
         ));
     }
 
-    let mut app = App::new(scalars, log_lines, cli.path.clone(), total_events, max_step);
+    Ok(ViewData {
+        scalars: loaded.scalars,
+        log_lines,
+        total_events,
+        max_step,
+    })
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    let initial = load_view_data(&cli.path)?;
+    let mut app = App::new(
+        initial.scalars,
+        initial.log_lines,
+        cli.path.clone(),
+        initial.total_events,
+        initial.max_step,
+    );
 
     // Override socket path if provided
     if let Some(ref sock) = cli.socket {
@@ -108,7 +112,17 @@ fn main() -> Result<()> {
     // ── Spawn agent daemon if --training-file is provided ───────────────
     let mut daemon_child: Option<Child> = None;
     if let Some(ref training_file) = cli.training_file {
-        match spawn_daemon(training_file, &cli.codebase_root, cli.auto, &app.daemon_socket) {
+        let start_training = cli.start_training || cli.training_cmd.is_some();
+        match spawn_daemon(
+            training_file,
+            &cli.codebase_root,
+            &cli.path,
+            cli.auto,
+            start_training,
+            cli.fresh_run,
+            cli.training_cmd.as_deref(),
+            &app.daemon_socket,
+        ) {
             Ok(child) => {
                 daemon_child = Some(child);
                 app.chat_status = "Daemon starting...".to_string();
@@ -122,15 +136,23 @@ fn main() -> Result<()> {
     // ── Setup terminal ──────────────────────────────────────────────────
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, app);
+    let result = run_app(&mut terminal, app, &cli.path, cli.refresh_ms);
 
     // ── Restore terminal ────────────────────────────────────────────────
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, crossterm::event::DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     // ── Kill daemon child if we spawned it ──────────────────────────────
@@ -150,7 +172,11 @@ fn main() -> Result<()> {
 fn spawn_daemon(
     training_file: &PathBuf,
     codebase_root: &PathBuf,
+    run_dir: &PathBuf,
     auto_mode: bool,
+    start_training: bool,
+    fresh_run: bool,
+    training_cmd: Option<&str>,
     socket_path: &PathBuf,
 ) -> Result<Child> {
     // Try python3 first, then python
@@ -163,17 +189,33 @@ fn spawn_daemon(
         .arg(training_file)
         .arg("--codebase-root")
         .arg(codebase_root)
+        .arg("--run-dir")
+        .arg(run_dir)
         .arg("--socket")
         .arg(socket_path)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
+    if let Some(training_cmd) = training_cmd.map(str::trim).filter(|s| !s.is_empty()) {
+        cmd.arg("--training-cmd").arg(training_cmd);
+    }
+
     if auto_mode {
         cmd.arg("--auto");
     }
+    if start_training {
+        cmd.arg("--start-training");
+    }
+    if fresh_run {
+        cmd.arg("--fresh-run");
+    }
 
-    let child = cmd.spawn()
-        .with_context(|| format!("Failed to spawn daemon with '{}'. Is og-agent-chat installed?", python))?;
+    let child = cmd.spawn().with_context(|| {
+        format!(
+            "Failed to spawn daemon with '{}'. Is og-agent-chat installed?",
+            python
+        )
+    })?;
 
     Ok(child)
 }
@@ -192,6 +234,128 @@ fn find_python() -> String {
         }
     }
     "python3".to_string()
+}
+
+fn tail_overlap(previous: &[String], current: &[String]) -> usize {
+    let max_overlap = previous.len().min(current.len());
+    for overlap in (0..=max_overlap).rev() {
+        if previous[previous.len().saturating_sub(overlap)..] == current[..overlap] {
+            return overlap;
+        }
+    }
+    0
+}
+
+fn is_known_log_prefix(token: &str) -> bool {
+    matches!(
+        token,
+        "daemon"
+            | "system"
+            | "info"
+            | "sucess"
+            | "success"
+            | "error"
+            | "important"
+            | "alert"
+            | "auto"
+    )
+}
+
+fn strip_known_log_prefixes(mut line: &str) -> &str {
+    loop {
+        let trimmed = line.trim_start();
+        let Some(after_bracket) = trimmed.strip_prefix('[') else {
+            return trimmed;
+        };
+        let Some(end) = after_bracket.find(']') else {
+            return trimmed;
+        };
+        let token = after_bracket[..end].trim().to_ascii_lowercase();
+        if !is_known_log_prefix(token.as_str()) {
+            return trimmed;
+        }
+        line = after_bracket[end + 1..].trim_start();
+    }
+}
+
+fn normalize_live_log_line(raw_line: &str) -> Option<String> {
+    let trimmed = raw_line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let stripped = strip_known_log_prefixes(trimmed);
+    let message = if stripped.is_empty() {
+        trimmed
+    } else {
+        stripped
+    };
+
+    let level = if lower.starts_with("[important]")
+        || lower.starts_with("[alert]")
+        || lower.starts_with("[auto]")
+    {
+        "important"
+    } else if lower.starts_with("[error]")
+        || lower.contains("traceback")
+        || lower.contains("exception")
+        || lower.contains("panic")
+        || lower.contains("fatal")
+        || lower.contains("failed")
+        || lower.contains("error")
+        || (lower.contains("exited with code") && !lower.contains("code 0"))
+    {
+        "error"
+    } else if lower.starts_with("[sucess]")
+        || lower.starts_with("[success]")
+        || lower.contains("succeeded")
+        || lower.contains("completed")
+        || lower.contains("restarted")
+        || lower.contains("exited with code 0")
+    {
+        "sucess"
+    } else {
+        "info"
+    };
+
+    Some(format!("[{}] {}", level, message))
+}
+
+fn format_alert_log_line(alert: &socket_client::AlertInfo) -> String {
+    format!(
+        "[important] alert {}: {} (current {:.6}, threshold {:.6})",
+        alert.metric, alert.message, alert.current, alert.threshold
+    )
+}
+
+fn update_auto_mode(app: &mut App, auto_mode: bool) -> bool {
+    let changed = app.auto_mode != auto_mode;
+    app.auto_mode = auto_mode;
+    if changed && app.live_logs_active {
+        let state = if auto_mode { "enabled" } else { "disabled" };
+        app.append_live_log(format!("[important] auto mode {}", state));
+    }
+    changed
+}
+
+fn set_copy_mode(app: &mut App, enabled: bool) -> Result<()> {
+    if app.copy_mode == enabled {
+        return Ok(());
+    }
+
+    let mut stdout = io::stdout();
+    if enabled {
+        execute!(stdout, crossterm::event::DisableMouseCapture)?;
+        app.copy_mode = true;
+        app.chat_status =
+            "Copy mode enabled — drag mouse to highlight text, press F6 to resume".to_string();
+    } else {
+        execute!(stdout, crossterm::event::EnableMouseCapture)?;
+        app.copy_mode = false;
+        app.chat_status = "Copy mode disabled — interactive mouse controls restored".to_string();
+    }
+    Ok(())
 }
 
 /// Messages from background threads to the main event loop.
@@ -214,13 +378,22 @@ enum BgMessage {
     LiveMetrics {
         metrics: serde_json::Map<String, serde_json::Value>,
         logs: Vec<String>,
+        alerts: Vec<socket_client::AlertInfo>,
         current_step: i64,
+        auto_mode: bool,
     },
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
+fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    mut app: App,
+    events_path: &Path,
+    refresh_ms: u64,
+) -> Result<()> {
     // Track layout regions for mouse hit-testing
     let mut layout = ui::LayoutRegions::default();
+    let refresh_interval = (refresh_ms > 0).then(|| Duration::from_millis(refresh_ms));
+    let mut last_refresh = Instant::now();
 
     // Channel for background daemon communication
     let (bg_tx, bg_rx) = mpsc::channel::<BgMessage>();
@@ -251,6 +424,59 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
     }
 
     loop {
+        if let Some(interval) = refresh_interval {
+            if last_refresh.elapsed() >= interval {
+                if let Ok(updated) = load_view_data(events_path) {
+                    let prev_events = app.total_events;
+                    let prev_step = app.max_step;
+                    let events_grew = updated.total_events > prev_events;
+                    let step_changed = updated.max_step != prev_step;
+                    app.replace_data(
+                        updated.scalars,
+                        updated.log_lines,
+                        updated.total_events,
+                        updated.max_step,
+                    );
+
+                    // Event-file refresh is also a live source (even when daemon is connected).
+                    if !app.live_logs_active && (events_grew || step_changed) {
+                        app.activate_live_logs();
+                        app.append_live_log(
+                            "[important] live mode: watching event stream updates".to_string(),
+                        );
+                        app.last_logged_step = prev_step;
+                    }
+
+                    if app.live_logs_active {
+                        if updated.total_events > prev_events {
+                            let delta = updated.total_events - prev_events;
+                            let suffix = if delta == 1 { "" } else { "s" };
+                            app.append_live_log(format!(
+                                "[info] {} new event{} parsed (total {})",
+                                delta, suffix, updated.total_events
+                            ));
+                        }
+
+                        if !app.daemon_connected && updated.max_step < app.last_logged_step {
+                            app.append_live_log(format!(
+                                "[info] step counter reset to {}",
+                                updated.max_step
+                            ));
+                            app.last_logged_step = updated.max_step;
+                        } else if updated.max_step > app.last_logged_step {
+                            let delta = updated.max_step - app.last_logged_step;
+                            app.append_live_log(format!(
+                                "[sucess] step {} completed (+{})",
+                                updated.max_step, delta
+                            ));
+                            app.last_logged_step = updated.max_step;
+                        }
+                    }
+                }
+                last_refresh = Instant::now();
+            }
+        }
+
         terminal.draw(|f| {
             layout = ui::draw(f, &mut app);
         })?;
@@ -259,12 +485,24 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
         while let Ok(msg) = bg_rx.try_recv() {
             match msg {
                 BgMessage::DaemonConnected(c) => {
+                    let was_connected = app.daemon_connected;
                     app.daemon_connected = c;
                     app.chat_status = if c {
                         "Connected".to_string()
                     } else {
                         "Disconnected".to_string()
                     };
+                    if was_connected != c && app.live_logs_active {
+                        let line = if c {
+                            "[info] daemon connected"
+                        } else {
+                            "[error] daemon disconnected"
+                        };
+                        app.append_live_log(line);
+                    }
+                    if !c {
+                        app.last_daemon_log_tail.clear();
+                    }
                 }
                 BgMessage::ChatHistory(messages) => {
                     app.update_chat_messages(messages);
@@ -273,9 +511,11 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                     app.agent_thinking = false;
                     app.update_chat_messages(messages);
                     // Store pending refactor if agent proposed code changes (non-auto)
-                    if plan.action == "refactor" && !plan.code_changes.is_empty() && !app.auto_mode {
+                    if plan.action == "refactor" && !plan.code_changes.is_empty() && !app.auto_mode
+                    {
                         app.pending_refactor = Some(plan);
-                        app.chat_status = "Refactor proposed — press y to apply, n to reject".to_string();
+                        app.chat_status =
+                            "Refactor proposed — press y to apply, n to reject".to_string();
                     } else {
                         app.chat_status = "Connected".to_string();
                     }
@@ -285,7 +525,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                     app.chat_status = format!("Error: {}", err);
                 }
                 BgMessage::RunStateUpdate { auto_mode } => {
-                    app.auto_mode = auto_mode;
+                    update_auto_mode(&mut app, auto_mode);
                 }
                 BgMessage::RefactorApplied { success, messages } => {
                     app.agent_thinking = false;
@@ -301,7 +541,23 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                     app.agent_thinking = false;
                     app.chat_status = format!("Refactor error: {}", err);
                 }
-                BgMessage::LiveMetrics { metrics, logs, current_step } => {
+                BgMessage::LiveMetrics {
+                    metrics,
+                    logs,
+                    alerts,
+                    current_step,
+                    auto_mode,
+                } => {
+                    let just_activated = !app.live_logs_active;
+                    if just_activated {
+                        app.activate_live_logs();
+                    }
+                    let auto_mode_changed = update_auto_mode(&mut app, auto_mode);
+                    if just_activated && !auto_mode_changed {
+                        let state = if auto_mode { "enabled" } else { "disabled" };
+                        app.append_live_log(format!("[important] auto mode {}", state));
+                    }
+
                     // Merge daemon metrics into TUI scalars
                     for (metric, values) in &metrics {
                         if let Some(arr) = values.as_array() {
@@ -310,7 +566,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                                     let step = current_step as f64;
                                     let entry = app.scalars.entry(metric.clone()).or_default();
                                     // Avoid duplicate step values
-                                    if entry.last().map_or(true, |last| (last.0 - step).abs() > 0.5) {
+                                    if entry
+                                        .last()
+                                        .map_or(true, |last| (last.0 - step).abs() > 0.5)
+                                    {
                                         entry.push((step, v));
                                     }
                                 }
@@ -319,16 +578,40 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                     }
                     // Update tags list
                     app.tags = app.scalars.keys().cloned().collect();
-                    // Merge daemon logs
+
+                    // Merge daemon logs using overlap to handle tail window shifts.
                     if !logs.is_empty() {
-                        let daemon_log_marker = "[daemon]";
-                        // Only add new daemon log lines
-                        let existing_daemon_count = app.log_lines.iter()
-                            .filter(|l| l.starts_with(daemon_log_marker))
-                            .count();
-                        for line in logs.iter().skip(existing_daemon_count) {
-                            app.log_lines.push(format!("{} {}", daemon_log_marker, line));
+                        let overlap = tail_overlap(&app.last_daemon_log_tail, &logs);
+                        for line in logs.iter().skip(overlap) {
+                            if let Some(formatted) = normalize_live_log_line(line) {
+                                app.append_live_log(formatted);
+                            }
                         }
+                        app.last_daemon_log_tail = logs;
+                    }
+
+                    // Surface daemon alerts as important lines.
+                    if alerts.len() < app.seen_alert_count {
+                        app.seen_alert_count = 0;
+                    }
+                    for alert in alerts.iter().skip(app.seen_alert_count) {
+                        app.append_live_log(format_alert_log_line(alert));
+                    }
+                    app.seen_alert_count = alerts.len();
+
+                    if current_step < app.last_logged_step {
+                        app.append_live_log(format!(
+                            "[info] step counter reset to {}",
+                            current_step
+                        ));
+                        app.last_logged_step = current_step;
+                    } else if current_step > app.last_logged_step {
+                        let delta = current_step - app.last_logged_step;
+                        app.append_live_log(format!(
+                            "[sucess] step {} completed (+{})",
+                            current_step, delta
+                        ));
+                        app.last_logged_step = current_step;
                     }
                     if current_step > app.max_step {
                         app.max_step = current_step;
@@ -359,7 +642,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                         let _ = tx.send(BgMessage::LiveMetrics {
                             metrics: rs.metrics,
                             logs: rs.logs,
+                            alerts: rs.alerts,
                             current_step: rs.current_step,
+                            auto_mode: rs.auto_mode,
                         });
                     }
                 }
@@ -374,6 +659,16 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
         match event::read()? {
             Event::Key(key) => {
                 if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                if key.code == KeyCode::F(6) {
+                    let enable_copy_mode = !app.copy_mode;
+                    set_copy_mode(&mut app, enable_copy_mode)?;
+                    continue;
+                }
+
+                if app.copy_mode {
                     continue;
                 }
 
@@ -425,19 +720,15 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                                 app.chat_status = "Sending...".to_string();
                                 let tx = bg_tx.clone();
                                 let sock = app.daemon_socket.clone();
-                                std::thread::spawn(move || {
-                                    match socket_client::send_chat_message(&content, &sock) {
-                                        Ok((plan, messages)) => {
-                                            let _ = tx.send(BgMessage::ChatSendResult {
-                                                plan,
-                                                messages,
-                                            });
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(BgMessage::ChatSendError(
-                                                e.to_string(),
-                                            ));
-                                        }
+                                std::thread::spawn(move || match socket_client::send_chat_message(
+                                    &content, &sock,
+                                ) {
+                                    Ok((plan, messages)) => {
+                                        let _ =
+                                            tx.send(BgMessage::ChatSendResult { plan, messages });
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(BgMessage::ChatSendError(e.to_string()));
                                     }
                                 });
                             }
@@ -465,26 +756,24 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                     KeyCode::Char('?') => app.toggle_help(),
                     KeyCode::Tab => app.cycle_tab(),
                     KeyCode::BackTab => app.cycle_tab(),
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        match app.active_tab {
-                            app::Tab::Graphs => app.scroll_metrics_down(),
-                            app::Tab::Logs => app.scroll_logs_down(),
-                            app::Tab::Chat => app.scroll_chat_down(),
-                        }
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        match app.active_tab {
-                            app::Tab::Graphs => app.scroll_metrics_up(),
-                            app::Tab::Logs => app.scroll_logs_up(),
-                            app::Tab::Chat => app.scroll_chat_up(),
-                        }
-                    }
+                    KeyCode::Char('j') | KeyCode::Down => match app.active_tab {
+                        app::Tab::Graphs => app.scroll_metrics_down(),
+                        app::Tab::Logs => app.scroll_logs_down(),
+                        app::Tab::Chat => app.scroll_chat_down(),
+                    },
+                    KeyCode::Char('k') | KeyCode::Up => match app.active_tab {
+                        app::Tab::Graphs => app.scroll_metrics_up(),
+                        app::Tab::Logs => app.scroll_logs_up(),
+                        app::Tab::Chat => app.scroll_chat_up(),
+                    },
                     KeyCode::Char('l') | KeyCode::Right => app.next_metric(),
                     KeyCode::Char('h') | KeyCode::Left => app.prev_metric(),
                     KeyCode::Char('i') if app.active_tab == app::Tab::Chat => {
                         app.chat_input_focused = true;
                     }
-                    KeyCode::Char('y') if app.active_tab == app::Tab::Chat && app.pending_refactor.is_some() => {
+                    KeyCode::Char('y')
+                        if app.active_tab == app::Tab::Chat && app.pending_refactor.is_some() =>
+                    {
                         if let Some(plan) = app.pending_refactor.clone() {
                             app.agent_thinking = true;
                             app.chat_status = "Applying refactor...".to_string();
@@ -493,10 +782,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                             std::thread::spawn(move || {
                                 match socket_client::apply_refactor(&plan, &sock) {
                                     Ok((success, messages)) => {
-                                        let _ = tx.send(BgMessage::RefactorApplied {
-                                            success,
-                                            messages,
-                                        });
+                                        let _ = tx
+                                            .send(BgMessage::RefactorApplied { success, messages });
                                     }
                                     Err(e) => {
                                         let _ = tx.send(BgMessage::RefactorError(e.to_string()));
@@ -505,7 +792,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                             });
                         }
                     }
-                    KeyCode::Char('n') if app.active_tab == app::Tab::Chat && app.pending_refactor.is_some() => {
+                    KeyCode::Char('n')
+                        if app.active_tab == app::Tab::Chat && app.pending_refactor.is_some() =>
+                    {
                         app.pending_refactor = None;
                         app.chat_status = "Refactor rejected".to_string();
                     }
@@ -564,24 +853,78 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                             }
                         }
                     }
-                    MouseEventKind::ScrollDown => {
-                        match app.active_tab {
-                            app::Tab::Graphs => app.scroll_metrics_down(),
-                            app::Tab::Logs => app.scroll_logs_down(),
-                            app::Tab::Chat => app.scroll_chat_down(),
-                        }
-                    }
-                    MouseEventKind::ScrollUp => {
-                        match app.active_tab {
-                            app::Tab::Graphs => app.scroll_metrics_up(),
-                            app::Tab::Logs => app.scroll_logs_up(),
-                            app::Tab::Chat => app.scroll_chat_up(),
-                        }
-                    }
+                    MouseEventKind::ScrollDown => match app.active_tab {
+                        app::Tab::Graphs => app.scroll_metrics_down(),
+                        app::Tab::Logs => app.scroll_logs_down(),
+                        app::Tab::Chat => app.scroll_chat_down(),
+                    },
+                    MouseEventKind::ScrollUp => match app.active_tab {
+                        app::Tab::Graphs => app.scroll_metrics_up(),
+                        app::Tab::Logs => app.scroll_logs_up(),
+                        app::Tab::Chat => app.scroll_chat_up(),
+                    },
                     _ => {}
                 }
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_live_log_line, tail_overlap};
+
+    #[test]
+    fn tail_overlap_handles_sliding_windows() {
+        let previous = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ];
+        let current = vec![
+            "c".to_string(),
+            "d".to_string(),
+            "e".to_string(),
+            "f".to_string(),
+        ];
+        assert_eq!(tail_overlap(&previous, &current), 2);
+    }
+
+    #[test]
+    fn normalize_strips_known_prefixes_and_keeps_info() {
+        let line = "[daemon] [info] training warmup started";
+        assert_eq!(
+            normalize_live_log_line(line),
+            Some("[info] training warmup started".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_marks_restart_as_success() {
+        let line = "[system] training restarted (pid=1234)";
+        assert_eq!(
+            normalize_live_log_line(line),
+            Some("[sucess] training restarted (pid=1234)".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_marks_traceback_as_error() {
+        let line = "Traceback (most recent call last):";
+        assert_eq!(
+            normalize_live_log_line(line),
+            Some("[error] Traceback (most recent call last):".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_marks_alert_as_important() {
+        let line = "[alert] val/loss crossed threshold";
+        assert_eq!(
+            normalize_live_log_line(line),
+            Some("[important] val/loss crossed threshold".to_string())
+        );
     }
 }

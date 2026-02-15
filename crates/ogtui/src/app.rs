@@ -84,6 +84,16 @@ pub struct App {
     pub auto_mode: bool,
     /// Pending refactor plan awaiting user approval (non-auto mode)
     pub pending_refactor: Option<ActionPlanResponse>,
+    /// Whether the logs tab is currently showing live daemon logs
+    pub live_logs_active: bool,
+    /// Last daemon log tail seen from get_run_state, used for dedupe
+    pub last_daemon_log_tail: Vec<String>,
+    /// Number of daemon alerts already surfaced in the log tab
+    pub seen_alert_count: usize,
+    /// Last step for which a success log line was added
+    pub last_logged_step: i64,
+    /// Copy mode disables mouse capture so terminal text selection works
+    pub copy_mode: bool,
 }
 
 impl App {
@@ -122,11 +132,80 @@ impl App {
             chat_status: "Disconnected".to_string(),
             auto_mode: false,
             pending_refactor: None,
+            live_logs_active: false,
+            last_daemon_log_tail: Vec::new(),
+            seen_alert_count: 0,
+            last_logged_step: max_step,
+            copy_mode: false,
         }
     }
 
     pub fn cycle_tab(&mut self) {
         self.active_tab = self.active_tab.next();
+    }
+
+    pub fn replace_data(
+        &mut self,
+        scalars: BTreeMap<String, Vec<(f64, f64)>>,
+        log_lines: Vec<String>,
+        total_events: usize,
+        max_step: i64,
+    ) {
+        let prev_tag = self.tags.get(self.selected_metric).cloned();
+
+        self.scalars = scalars;
+        self.tags = self.scalars.keys().cloned().collect();
+        self.total_events = total_events;
+        self.max_step = max_step;
+        if !self.live_logs_active {
+            self.log_lines = log_lines;
+            self.last_logged_step = max_step;
+        }
+
+        if self.tags.is_empty() {
+            self.selected_metric = 0;
+            self.focused_metric = None;
+            self.metrics_scroll = 0;
+        } else if let Some(tag) = prev_tag {
+            if let Some(index) = self.tags.iter().position(|t| t == &tag) {
+                self.selected_metric = index;
+            } else if self.selected_metric >= self.tags.len() {
+                self.selected_metric = self.tags.len() - 1;
+            }
+        } else if self.selected_metric >= self.tags.len() {
+            self.selected_metric = self.tags.len() - 1;
+        }
+
+        if let Some(focused) = self.focused_metric {
+            if focused >= self.tags.len() {
+                self.focused_metric = None;
+            }
+        }
+
+        self.ensure_metric_visible();
+        let max_logs_scroll = self.log_lines.len().saturating_sub(1) as u16;
+        if self.logs_scroll > max_logs_scroll {
+            self.logs_scroll = max_logs_scroll;
+        }
+    }
+
+    pub fn activate_live_logs(&mut self) {
+        if self.live_logs_active {
+            return;
+        }
+        self.live_logs_active = true;
+        self.log_lines = vec![
+            "-- live run log --".to_string(),
+            "[info] listening to live daemon updates".to_string(),
+        ];
+        self.logs_scroll = self.log_lines.len().saturating_sub(1) as u16;
+        self.last_daemon_log_tail.clear();
+        self.seen_alert_count = 0;
+    }
+
+    pub fn append_live_log(&mut self, line: impl Into<String>) {
+        self.log_lines.push(line.into());
+        self.logs_scroll = self.log_lines.len().saturating_sub(1) as u16;
     }
 
     pub fn toggle_help(&mut self) {
@@ -162,7 +241,9 @@ impl App {
 
     /// Scroll the metrics grid so the selected metric is visible.
     fn ensure_metric_visible(&mut self) {
-        if self.metrics_cols == 0 { return; }
+        if self.tags.is_empty() || self.metrics_cols == 0 {
+            return;
+        }
         let selected_row = self.selected_metric / self.metrics_cols;
         if selected_row < self.metrics_scroll {
             self.metrics_scroll = selected_row;
@@ -172,7 +253,9 @@ impl App {
     }
 
     pub fn scroll_metrics_down(&mut self) {
-        if self.tags.is_empty() || self.metrics_cols == 0 { return; }
+        if self.tags.is_empty() || self.metrics_cols == 0 {
+            return;
+        }
         let new = self.selected_metric + self.metrics_cols;
         if new < self.tags.len() {
             self.selected_metric = new;
@@ -184,7 +267,9 @@ impl App {
     }
 
     pub fn scroll_metrics_up(&mut self) {
-        if self.tags.is_empty() || self.metrics_cols == 0 { return; }
+        if self.tags.is_empty() || self.metrics_cols == 0 {
+            return;
+        }
         if self.selected_metric >= self.metrics_cols {
             self.selected_metric -= self.metrics_cols;
         } else {
