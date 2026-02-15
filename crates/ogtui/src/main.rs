@@ -342,12 +342,15 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
             last_poll = Instant::now();
             let tx = bg_tx.clone();
             let sock = app.daemon_socket.clone();
+            let thinking = app.agent_thinking;
             std::thread::spawn(move || {
                 let connected = socket_client::ping(&sock).is_ok();
                 let _ = tx.send(BgMessage::DaemonConnected(connected));
                 if connected {
-                    if let Ok(history) = socket_client::get_chat_history(&sock) {
-                        let _ = tx.send(BgMessage::ChatHistory(history));
+                    if !thinking {
+                        if let Ok(history) = socket_client::get_chat_history(&sock) {
+                            let _ = tx.send(BgMessage::ChatHistory(history));
+                        }
                     }
                     if let Ok(rs) = socket_client::get_run_state(&sock) {
                         let _ = tx.send(BgMessage::RunStateUpdate {
@@ -407,6 +410,17 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                         KeyCode::Enter => {
                             let content = app.chat_input_take();
                             if !content.is_empty() && app.daemon_connected {
+                                // Show user message immediately
+                                app.chat_messages.push(socket_client::ChatMessage {
+                                    sender: "user".to_string(),
+                                    content: content.clone(),
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs_f64())
+                                        .unwrap_or(0.0),
+                                });
+                                let len = app.chat_messages.len();
+                                app.chat_scroll = len.saturating_sub(1) as u16;
                                 app.agent_thinking = true;
                                 app.chat_status = "Sending...".to_string();
                                 let tx = bg_tx.clone();
