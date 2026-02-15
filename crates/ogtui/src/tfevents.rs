@@ -3,7 +3,7 @@ use prost::Message;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Cursor, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ── Minimal protobuf definitions (matching TensorFlow event.proto / summary.proto) ──
 
@@ -41,7 +41,6 @@ pub struct SummaryValue {
     /// Simple scalar value.
     #[prost(float, optional, tag = "2")]
     pub simple_value: Option<f32>,
-
     // We skip other value types (image, histo, tensor, etc.) — only scalars matter.
 }
 
@@ -57,6 +56,13 @@ pub struct ScalarEvent {
     pub value: f64,
 }
 
+/// Parsed run payload used by the TUI.
+#[derive(Debug, Clone)]
+pub struct LoadedRun {
+    pub scalars: BTreeMap<String, Vec<(f64, f64)>>,
+    pub events: Vec<ScalarEvent>,
+}
+
 // ── Record-level reader ─────────────────────────────────────────────────────
 
 /// TF record format per record:
@@ -70,19 +76,27 @@ fn masked_crc32c(data: &[u8]) -> u32 {
     ((crc >> 15) | (crc << 17)).wrapping_add(0xa282_ead8)
 }
 
+fn read_exact_or_eof(cursor: &mut Cursor<&[u8]>, buf: &mut [u8]) -> Result<bool> {
+    match cursor.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn read_record(cursor: &mut Cursor<&[u8]>) -> Result<Option<Vec<u8>>> {
     // Read 8-byte length
     let mut len_buf = [0u8; 8];
-    match cursor.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
+    if !read_exact_or_eof(cursor, &mut len_buf)? {
+        return Ok(None);
     }
     let data_len = u64::from_le_bytes(len_buf) as usize;
 
     // Read 4-byte masked CRC of length
     let mut len_crc_buf = [0u8; 4];
-    cursor.read_exact(&mut len_crc_buf)?;
+    if !read_exact_or_eof(cursor, &mut len_crc_buf)? {
+        return Ok(None);
+    }
     let len_crc = u32::from_le_bytes(len_crc_buf);
     let expected_len_crc = masked_crc32c(&len_buf);
     if len_crc != expected_len_crc {
@@ -91,11 +105,15 @@ fn read_record(cursor: &mut Cursor<&[u8]>) -> Result<Option<Vec<u8>>> {
 
     // Read data
     let mut data = vec![0u8; data_len];
-    cursor.read_exact(&mut data)?;
+    if !read_exact_or_eof(cursor, &mut data)? {
+        return Ok(None);
+    }
 
     // Read 4-byte masked CRC of data
     let mut data_crc_buf = [0u8; 4];
-    cursor.read_exact(&mut data_crc_buf)?;
+    if !read_exact_or_eof(cursor, &mut data_crc_buf)? {
+        return Ok(None);
+    }
     let data_crc = u32::from_le_bytes(data_crc_buf);
     let expected_data_crc = masked_crc32c(&data);
     if data_crc != expected_data_crc {
@@ -114,8 +132,7 @@ pub fn parse_events_file(path: &Path) -> Result<Vec<ScalarEvent>> {
     let mut events = Vec::new();
 
     while let Some(data) = read_record(&mut cursor)? {
-        let event = Event::decode(data.as_slice())
-            .with_context(|| "decoding Event protobuf")?;
+        let event = Event::decode(data.as_slice()).with_context(|| "decoding Event protobuf")?;
 
         if let Some(summary) = event.summary {
             for val in summary.value {
@@ -134,33 +151,44 @@ pub fn parse_events_file(path: &Path) -> Result<Vec<ScalarEvent>> {
     Ok(events)
 }
 
-/// Discover all `.tfevents` files in a directory (recursively) and parse them.
-/// Returns a map from tag → sorted list of (step, value).
-pub fn load_scalars(dir: &Path) -> Result<BTreeMap<String, Vec<(f64, f64)>>> {
-    let mut all_events: Vec<ScalarEvent> = Vec::new();
-
-    if dir.is_file() {
-        all_events.extend(parse_events_file(dir)?);
-    } else {
-        for entry in walkdir(dir)? {
-            if entry
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .contains("tfevents")
-            {
-                match parse_events_file(&entry) {
-                    Ok(evts) => all_events.extend(evts),
-                    Err(e) => eprintln!("warning: skipping {}: {e}", entry.display()),
-                }
-            }
-        }
+fn discover_event_files(path: &Path) -> Result<Vec<PathBuf>> {
+    if path.is_file() {
+        return Ok(vec![path.to_path_buf()]);
     }
 
+    let mut files = Vec::new();
+    for entry in walkdir(path)? {
+        if entry
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .contains("tfevents")
+        {
+            files.push(entry);
+        }
+    }
+    Ok(files)
+}
+
+fn load_events(path: &Path) -> Result<Vec<ScalarEvent>> {
+    let mut all_events: Vec<ScalarEvent> = Vec::new();
+    for entry in discover_event_files(path)? {
+        match parse_events_file(&entry) {
+            Ok(evts) => all_events.extend(evts),
+            Err(e) => eprintln!("warning: skipping {}: {e}", entry.display()),
+        }
+    }
+    Ok(all_events)
+}
+
+/// Discover `.tfevents` data under `path` and build both scalar series and raw events.
+pub fn load_run(path: &Path) -> Result<LoadedRun> {
+    let events = load_events(path)?;
+
     let mut scalars: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
-    for ev in all_events {
+    for ev in &events {
         scalars
-            .entry(ev.tag)
+            .entry(ev.tag.clone())
             .or_default()
             .push((ev.step as f64, ev.value));
     }
@@ -170,7 +198,7 @@ pub fn load_scalars(dir: &Path) -> Result<BTreeMap<String, Vec<(f64, f64)>>> {
         series.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     }
 
-    Ok(scalars)
+    Ok(LoadedRun { scalars, events })
 }
 
 /// Simple recursive directory walk (avoids adding walkdir dependency).

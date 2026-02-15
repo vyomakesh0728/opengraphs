@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import stat
 import sys
 from dataclasses import dataclass, field
@@ -24,6 +25,10 @@ class DaemonConfig:
     training_file: Path
     codebase_root: Path
     socket_path: Path
+    run_dir: Path | None = None
+    training_cmd: str | None = None
+    start_training: bool = False
+    fresh_run: bool = False
     auto_mode: bool = False
     alert_rules: list[AlertRule] = field(default_factory=list)
 
@@ -68,6 +73,29 @@ def _prepare_socket_path(socket_path: Path) -> None:
 def _default_socket_path() -> str:
     tmpdir = os.getenv("TMPDIR") or os.getenv("TEMP") or os.getenv("TMP") or "/tmp"
     return str(Path(tmpdir) / "opengraphs-ogd.sock")
+
+
+def _clear_tfevents_files(run_dir: Path) -> int:
+    removed = 0
+    if not run_dir.exists():
+        return removed
+    for path in run_dir.rglob("*"):
+        if path.is_file() and "tfevents" in path.name:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError as exc:
+                LOGGER.warning("Failed to remove %s: %s", path, exc)
+    return removed
+
+
+def _resolve_run_dir(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    # If user passed a single event file path, use its parent directory for TB output.
+    if "tfevents" in path.name:
+        return path.parent
+    return path
 
 
 async def serve(config: DaemonConfig) -> None:
@@ -118,9 +146,21 @@ async def serve(config: DaemonConfig) -> None:
 
         env = dict(os.environ)
         env.setdefault("OGD_SOCKET", str(config.socket_path))
+        run_dir = _resolve_run_dir(config.run_dir)
+        if run_dir is not None:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            env.setdefault("TB_LOG_DIR", str(run_dir))
+        env.setdefault("ENABLE_TB", "1")
+
+        if config.training_cmd:
+            command = shlex.split(config.training_cmd)
+            if not command:
+                raise RuntimeError("empty training command")
+        else:
+            command = [sys.executable, str(state.training_file)]
+
         process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            str(state.training_file),
+            *command,
             cwd=str(state.codebase_root),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -128,6 +168,12 @@ async def serve(config: DaemonConfig) -> None:
         )
         training_process = process
         run_state.append_log(f"[system] training restarted (pid={process.pid})")
+        run_state.append_log(
+            "[system] launch command: "
+            + " ".join(shlex.quote(part) for part in command)
+        )
+        if run_dir is not None:
+            run_state.append_log(f"[system] TB_LOG_DIR={run_dir}")
         training_log_task = asyncio.create_task(_stream_training_logs(process))
 
     agent = AgentEngine(
@@ -191,6 +237,17 @@ async def serve(config: DaemonConfig) -> None:
     server = await asyncio.start_unix_server(handle_client, path=str(config.socket_path))
     async with server:
         try:
+            if config.start_training:
+                run_dir = _resolve_run_dir(config.run_dir)
+                if config.fresh_run and run_dir is not None:
+                    removed = _clear_tfevents_files(run_dir)
+                    run_state.append_log(
+                        f"[system] fresh run enabled; removed {removed} existing tfevents file(s)"
+                    )
+                try:
+                    await _restart_training_process(run_state)
+                except Exception as exc:
+                    run_state.append_log(f"[error] failed to start training: {exc}")
             await server.serve_forever()
         finally:
             await _stop_training_process()
@@ -330,6 +387,28 @@ def main() -> None:
         help="Root directory for codebase indexing",
     )
     parser.add_argument(
+        "--run-dir",
+        default=os.getenv("OG_RUN_DIR"),
+        help="Run directory for TensorBoard event output (used for TB_LOG_DIR if unset)",
+    )
+    parser.add_argument(
+        "--training-cmd",
+        default=os.getenv("OG_TRAINING_CMD"),
+        help='Training command to run (e.g. "torchrun --standalone --nproc_per_node=1 train_gpt.py")',
+    )
+    parser.add_argument(
+        "--start-training",
+        action="store_true",
+        default=os.getenv("OG_START_TRAINING", "0") == "1",
+        help="Start training process automatically on daemon startup",
+    )
+    parser.add_argument(
+        "--fresh-run",
+        action="store_true",
+        default=os.getenv("OG_FRESH_RUN", "0") == "1",
+        help="Delete existing tfevents files under --run-dir before auto-start",
+    )
+    parser.add_argument(
         "--auto",
         action="store_true",
         default=os.getenv("OG_AGENT_AUTO", "0") == "1",
@@ -344,6 +423,10 @@ def main() -> None:
         training_file=Path(args.training_file),
         codebase_root=Path(args.codebase_root),
         socket_path=Path(args.socket),
+        run_dir=Path(args.run_dir) if args.run_dir else None,
+        training_cmd=args.training_cmd,
+        start_training=args.start_training,
+        fresh_run=args.fresh_run,
         auto_mode=args.auto,
         alert_rules=load_alert_rules_from_env(),
     )
