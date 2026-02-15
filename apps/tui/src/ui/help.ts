@@ -10,7 +10,7 @@ const SHORTCUTS = [
   ["Esc", "Blur input / close modal"],
   ["q", "Quit (when input not focused)"],
   ["Enter", "Submit input"],
-  ["Shift+Enter", "New line in input"],
+  ["Ctrl/Cmd+Enter", "New line in input"],
   ["?", "Toggle shortcuts (when input not focused)"],
   ["", ""],
   ["Cmd+C", "Copy selection or input"],

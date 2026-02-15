@@ -5,7 +5,13 @@ import { createGraphsTab } from "./ui/graphs"
 import { createLogsTab } from "./ui/logs"
 import { createFooter } from "./ui/footer"
 import { createHelpModal } from "./ui/help"
-import { startDaemonPolling } from "./lib/daemon"
+import {
+  getChatHistory,
+  getRunState,
+  sendChatMessage,
+  startDaemonPolling,
+} from "./lib/daemon"
+import type { ChatMessage } from "./lib/daemon"
 
 // --- Read version ---
 let version = "0.1.0"
@@ -18,10 +24,7 @@ try {
 
 // --- Determine initial tab ---
 const args = process.argv.slice(2)
-const hasRunTarget = args.some(
-  (a) => a === "--run" || a === "-r" || a.startsWith("--run="),
-)
-const initialTab: TabName = hasRunTarget ? "graphs" : "chat"
+const initialTab = determineInitialTab(args)
 
 // --- Create renderer ---
 const renderer = await createCliRenderer({
@@ -55,14 +58,17 @@ const tabBody = new BoxRenderable(renderer, {
 const chatTab = createChatTab(renderer, version)
 const graphsResult = createGraphsTab(renderer)
 const graphsTab = graphsResult.container
-const logsTab = createLogsTab(renderer)
+const logsResult = createLogsTab(renderer)
+const logsTab = logsResult.container
+const autoModeFromEnv = process.env.OG_AGENT_AUTO === "1"
+chatTab.setAutoMode(autoModeFromEnv)
 
 // Only show active tab
-chatTab.visible = initialTab === "chat"
+chatTab.container.visible = initialTab === "chat"
 graphsTab.visible = initialTab === "graphs"
 logsTab.visible = initialTab === "logs"
 
-tabBody.add(chatTab)
+tabBody.add(chatTab.container)
 tabBody.add(graphsTab)
 tabBody.add(logsTab)
 content.add(tabBody)
@@ -82,9 +88,48 @@ const stopPolling = startDaemonPolling((status) => {
   graphsResult.updateDaemonStatus(status)
 })
 
+let chatSignature = ""
+let latestChatHistory: ChatMessage[] = []
+
+async function refreshChatHistory() {
+  try {
+    const response = await getChatHistory()
+    if (!response.ok) return
+    const signature = response.chat_history
+      .map((msg) => `${msg.timestamp}:${msg.sender}:${msg.content}`)
+      .join("|")
+    if (signature === chatSignature) return
+    chatSignature = signature
+    latestChatHistory = response.chat_history
+    chatTab.setMessages(response.chat_history)
+  } catch {
+    // ignore polling errors
+  }
+}
+
+async function refreshRunState() {
+  try {
+    const response = await getRunState(200, 1)
+    if (!response.ok) return
+    graphsResult.updateRunState(response.run_state)
+    logsResult.setLogs(response.run_state.logs)
+    chatTab.setAutoMode(response.run_state.auto_mode ?? autoModeFromEnv)
+  } catch {
+    // ignore polling errors
+  }
+}
+
+const dataInterval = setInterval(() => {
+  void refreshChatHistory()
+  void refreshRunState()
+}, 500)
+
+void refreshChatHistory()
+void refreshRunState()
+
 // --- Tab switching ---
 function switchTab(tab: TabName) {
-  chatTab.visible = tab === "chat"
+  chatTab.container.visible = tab === "chat"
   graphsTab.visible = tab === "graphs"
   logsTab.visible = tab === "logs"
 }
@@ -122,10 +167,46 @@ function handleInputSubmit(text: string) {
     header.setActiveTab("logs")
     return
   }
+
+  void sendUserMessage(text)
+}
+
+async function sendUserMessage(text: string) {
+  chatTab.setThinking(true)
+  try {
+    const response = await sendChatMessage(text)
+    if (response.ok) {
+      latestChatHistory = response.chat_history
+      chatTab.setMessages(response.chat_history)
+    } else {
+      const fallback = latestChatHistory.length > 0 ? latestChatHistory : []
+      chatTab.setMessages([
+        ...fallback,
+        {
+          sender: "system",
+          content: `Failed to send message: ${response.error}`,
+          timestamp: Date.now() / 1000,
+        },
+      ])
+    }
+  } catch (err: any) {
+    const fallback = latestChatHistory.length > 0 ? latestChatHistory : []
+    chatTab.setMessages([
+      ...fallback,
+      {
+        sender: "system",
+        content: `Failed to send message: ${err?.message ?? "unknown error"}`,
+        timestamp: Date.now() / 1000,
+      },
+    ])
+  } finally {
+    chatTab.setThinking(false)
+  }
 }
 
 // --- Keyboard shortcuts ---
-renderer.keyInput.on("keypress", (key) => {
+const keyInput = renderer.keyInput as any
+keyInput.on("keypress", (key: any) => {
   const inputFocused = footer.isInputFocused()
 
   // Help modal toggle with ?
@@ -177,16 +258,30 @@ renderer.keyInput.on("keypress", (key) => {
 })
 
 // Paste focuses input if not focused
-renderer.keyInput.on("paste", (event) => {
+keyInput.on("paste", (_event: any) => {
   if (!footer.isInputFocused()) {
     footer.focusInput()
   }
 })
 
 // --- Responsive layout ---
-renderer.on("resize", (width: number, _height: number) => {
+;(renderer as any).on("resize", (width: number, _height: number) => {
   graphsResult.updateLayout(width)
 })
+
+function determineInitialTab(argv: string[]): TabName {
+  const hasLogsTarget = argv.some((arg) =>
+    arg === "--logs" || arg === "--log" || arg === "--tail" || arg.startsWith("--logs="),
+  )
+  if (hasLogsTarget) return "logs"
+
+  const hasRunTarget = argv.some((arg) =>
+    arg === "--run" || arg === "-r" || arg.startsWith("--run="),
+  )
+  if (hasRunTarget) return "graphs"
+
+  return "chat"
+}
 
 // Initial layout update
 graphsResult.updateLayout(renderer.width)
@@ -194,6 +289,7 @@ graphsResult.updateLayout(renderer.width)
 // --- Cleanup ---
 function cleanup() {
   stopPolling()
+  clearInterval(dataInterval)
   renderer.destroy()
   process.exit(0)
 }

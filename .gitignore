@@ -11,3 +11,15 @@ dist/
 coverage/
 
 .DS_Store
+
+
+# Python caches
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Lockfiles
+uv.lock
+**/uv.lock
+bun.lockb
+**/bun.lockb

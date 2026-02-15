@@ -4,7 +4,7 @@ import {
   TextRenderable,
   ScrollBoxRenderable,
 } from "@opentui/core"
-import { type DaemonStatus } from "../lib/daemon"
+import { type DaemonStatus, type RunStateSnapshot } from "../lib/daemon"
 
 const METRIC_LABELS = [
   "train/loss", "val/loss", "reward", "grad_norm", "throughput", "lr",
@@ -20,6 +20,7 @@ const TEXT_DIM = "#9BA3AF"
 export interface GraphsTabResult {
   container: BoxRenderable
   updateDaemonStatus: (status: DaemonStatus) => void
+  updateRunState: (runState: RunStateSnapshot) => void
   updateLayout: (width: number) => void
 }
 
@@ -49,6 +50,8 @@ export function createGraphsTab(renderer: CliRenderer): GraphsTabResult {
     width: "100%",
   })
 
+  const metricValues = new Map<string, TextRenderable>()
+
   for (const label of METRIC_LABELS) {
     const card = new BoxRenderable(renderer, {
       id: `metric-${label}`,
@@ -66,6 +69,7 @@ export function createGraphsTab(renderer: CliRenderer): GraphsTabResult {
     })
     card.add(placeholder)
     metricsGrid.add(card)
+    metricValues.set(label, placeholder)
   }
 
   metricsScroll.add(metricsGrid)
@@ -181,6 +185,34 @@ export function createGraphsTab(renderer: CliRenderer): GraphsTabResult {
     }
   }
 
+  function updateRunState(runState: RunStateSnapshot) {
+    for (const label of METRIC_LABELS) {
+      const target = metricValues.get(label)
+      if (!target) continue
+      const values = runState.metrics[label]
+      if (values && values.length > 0) {
+        const latest = values[values.length - 1]
+        target.content = formatMetric(latest)
+        target.fg = "#d1d5db"
+      } else {
+        target.content = "--"
+        target.fg = TEXT_DIM
+      }
+    }
+
+    const lastAlert = runState.alerts[runState.alerts.length - 1]
+    statsBlock.content = [
+      "",
+      "run:    --",
+      "config: default",
+      "env:    local",
+      "seed:   42",
+      "device: --",
+      `step:   ${runState.current_step ?? "--"}`,
+      lastAlert ? `alert:  ${lastAlert.message}` : "alert:  --",
+    ].join("\n")
+  }
+
   function updateLayout(width: number) {
     const metricChildren = metricsGrid.getChildren() as BoxRenderable[]
     let cols: string
@@ -201,5 +233,13 @@ export function createGraphsTab(renderer: CliRenderer): GraphsTabResult {
     }
   }
 
-  return { container, updateDaemonStatus, updateLayout }
+  return { container, updateDaemonStatus, updateRunState, updateLayout }
+}
+
+function formatMetric(value: number): string {
+  if (!Number.isFinite(value)) return "--"
+  const abs = Math.abs(value)
+  if (abs >= 1000) return value.toFixed(0)
+  if (abs >= 1) return value.toFixed(4)
+  return value.toExponential(2)
 }

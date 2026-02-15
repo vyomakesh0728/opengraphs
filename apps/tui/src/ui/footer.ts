@@ -90,13 +90,7 @@ export function createFooter(
     focusedTextColor: "#ffffff",
     placeholder: "Type a message...",
     placeholderColor: "#6b7280",
-    onSubmit: () => {
-      const text = textarea.plainText.trim()
-      if (!text) return
-      closeMentions()
-      onSubmit(text)
-      textarea.clear()
-    },
+    onSubmit: submitInput,
   })
 
   inputFrame.add(prompt)
@@ -197,6 +191,22 @@ export function createFooter(
     closeMentions()
   }
 
+  function submitInput() {
+    const text = textarea.plainText.trim()
+    if (!text) return
+    closeMentions()
+    onSubmit(text)
+    textarea.clear()
+  }
+
+  function insertNewline() {
+    const text = textarea.plainText
+    const offset = textarea.cursorOffset
+    const newText = `${text.slice(0, offset)}\n${text.slice(offset)}`
+    textarea.replaceText(newText)
+    textarea.editBuffer.setCursorByOffset(offset + 1)
+  }
+
   // Track content changes for mention detection
   textarea.onContentChange = () => {
     updateMentions()
@@ -205,6 +215,14 @@ export function createFooter(
   // Override keypress for mention navigation
   const origHandleKeyPress = textarea.handleKeyPress.bind(textarea)
   textarea.handleKeyPress = (key) => {
+    const isReturn = key.name === "return" || key.name === "enter"
+    const isCtrl = Boolean(key.ctrl || key.meta)
+
+    if (isReturn && isCtrl) {
+      insertNewline()
+      return true
+    }
+
     if (mentionActive) {
       if (key.name === "up") {
         mentionIndex = Math.max(0, mentionIndex - 1)
@@ -226,6 +244,10 @@ export function createFooter(
         closeMentions()
         return true
       }
+    }
+    if (isReturn && !isCtrl) {
+      submitInput()
+      return true
     }
     return origHandleKeyPress(key)
   }

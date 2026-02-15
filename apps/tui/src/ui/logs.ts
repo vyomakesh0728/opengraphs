@@ -32,7 +32,12 @@ const SAMPLE_LOGS = [
   "[2025-06-14 10:34:38] INFO  val/loss=2.512 | val/accuracy=0.534",
 ]
 
-export function createLogsTab(renderer: CliRenderer): BoxRenderable {
+export interface LogsTabResult {
+  container: ScrollBoxRenderable
+  setLogs: (logs: string[]) => void
+}
+
+export function createLogsTab(renderer: CliRenderer): LogsTabResult {
   const scroll = new ScrollBoxRenderable(renderer, {
     id: "logs-scroll",
     flexGrow: 1,
@@ -50,18 +55,34 @@ export function createLogsTab(renderer: CliRenderer): BoxRenderable {
     paddingLeft: 1,
     paddingTop: 1,
   })
+  scroll.add(logsContent)
 
-  for (let i = 0; i < SAMPLE_LOGS.length; i++) {
-    const line = SAMPLE_LOGS[i]
-    const isHeader = i === 0
-    const text = new TextRenderable(renderer, {
-      id: `log-line-${i}`,
-      content: line,
-      fg: isHeader ? "#6b7280" : "#d1d5db",
-    })
-    logsContent.add(text)
+  let currentLogs = SAMPLE_LOGS
+
+  function renderLogs() {
+    for (const child of logsContent.getChildren()) {
+      logsContent.remove(child.id)
+    }
+
+    const lines = currentLogs.length > 0 ? currentLogs : SAMPLE_LOGS
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      const isHeader = i === 0
+      const text = new TextRenderable(renderer, {
+        id: `log-line-${i}`,
+        content: line,
+        fg: isHeader ? "#6b7280" : "#d1d5db",
+      })
+      logsContent.add(text)
+    }
   }
 
-  scroll.add(logsContent)
-  return scroll
+  function setLogs(logs: string[]) {
+    currentLogs = logs
+    renderLogs()
+  }
+
+  renderLogs()
+
+  return { container: scroll, setLogs }
 }
