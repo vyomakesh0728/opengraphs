@@ -421,6 +421,32 @@ class AgentEngine:
                 )
         return AgentResponse(raw_output=raw, plan=plan)
 
+    async def execute_plan(self, plan: ActionPlan) -> ExecutionResult:
+        """Execute a refactor plan (called from TUI approve, bypasses auto_mode)."""
+        if plan.action != "refactor" or not plan.code_changes:
+            return ExecutionResult(success=False, error="No refactor to apply.")
+        checkpoint_id = create_checkpoint(self.run_state, self.executor.checkpoint_dir)
+        try:
+            apply_diff(self.run_state.training_file, plan.code_changes)
+            if self.executor.restart_callback:
+                result = self.executor.restart_callback(self.run_state)
+                if asyncio.iscoroutine(result):
+                    await result
+            self.add_chat_message(
+                "system",
+                f"Code refactored from checkpoint {checkpoint_id}.",
+            )
+            return ExecutionResult(success=True, checkpoint_id=checkpoint_id)
+        except Exception as exc:
+            restore_checkpoint(checkpoint_id, self.run_state, self.executor.checkpoint_dir)
+            self.add_chat_message(
+                "system",
+                f"Refactor failed: {exc}. Rolled back.",
+            )
+            return ExecutionResult(
+                success=False, checkpoint_id=checkpoint_id, error=str(exc)
+            )
+
 
 async def agent_loop(
     run_state: RunState,

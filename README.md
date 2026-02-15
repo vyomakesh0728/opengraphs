@@ -9,7 +9,6 @@ Local-first, TUI-native experiment tracking for AI runs over SSH.
 [![GitHub Stars](https://img.shields.io/github/stars/vyomakesh0728/opengraphs?style=flat-square)](https://github.com/vyomakesh0728/opengraphs/stargazers)
 [![GitHub Downloads](https://img.shields.io/github/downloads/vyomakesh0728/opengraphs/total?style=flat-square)](https://github.com/vyomakesh0728/opengraphs/releases)
 [![Rust](https://img.shields.io/badge/rust-first-orange?style=flat-square)](https://www.rust-lang.org/)
-[![OpenTUI](https://img.shields.io/badge/tui-opentui-black?style=flat-square)](https://github.com/anomalyco/opentui)
 
 ## Why this exists
 
@@ -18,30 +17,40 @@ Browser dashboards and port forwarding are painful on remote GPU boxes. `opengra
 - fast experiment views in SSH sessions
 - lightweight local-first tracking
 - simple run comparison and filtering
-- Rust-first core, with isolated Python only for agent chat workflows
+- Rust-first core (ratatui TUI), with isolated Python for DSPy/RLM agent chat
+- agent auto-diagnoses training issues and can refactor code with `--auto`
 
 ## Current workspace
 
-- `crates/og`: CLI entrypoint
+- `crates/ogtui`: Rust ratatui TUI (graphs, logs, agent chat tabs)
 - `crates/ogd`: daemon/backend + Trackio Rust client integration point
-- `apps/tui`: Bun + OpenTUI app
-- `python/agent-chat`: isolated Python env for agent features
+- `python/agent-chat`: Python agent daemon (DSPy RLM + ReAct, alerts, code patching)
 
 ## Quickstart (developer)
 
 ```bash
-# from repo root
-cargo check
-cargo run -p og
-bun run tui
+# Build + run TUI
+cargo run -p ogtui -- --path runs/
+
+# Install agent dependencies
+uv pip install -e python/agent-chat/
+
+# Start agent daemon (separate terminal)
+export OPENAI_API_KEY="your-key"
+python3 -m og_agent_chat.server --training-file train.py --codebase-root .
+
+# Or with auto-refactor mode
+python3 -m og_agent_chat.server --training-file train.py --codebase-root . --auto
 ```
 
-Python agent-chat environment:
+## Agent chat
 
-```bash
-cd python/agent-chat
-uv sync
-```
+The TUI has a built-in **chat** tab that connects to the Python agent daemon via Unix socket.
+
+- **DSPy ReAct** for tool-calling (reads metrics, logs, codebase)
+- **DSPy RLM** for codebase exploration and code editing
+- **`--auto` mode**: agent applies unified diffs to your training script and restarts training
+- **Checkpoint/rollback**: every refactor is checkpointed; failures auto-rollback
 
 ## Stars graph
 

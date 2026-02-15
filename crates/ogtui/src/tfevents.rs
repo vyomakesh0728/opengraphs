@@ -49,6 +49,7 @@ pub struct SummaryValue {
 
 /// A parsed scalar event.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ScalarEvent {
     pub tag: String,
     pub step: i64,

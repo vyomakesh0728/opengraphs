@@ -54,6 +54,7 @@ pub fn draw(f: &mut Frame, app: &mut App) -> LayoutRegions {
         match app.active_tab {
             Tab::Graphs => draw_graphs_tab(f, app, root_chunks[1], &mut regions),
             Tab::Logs => draw_logs_tab(f, app, root_chunks[1]),
+            Tab::Chat => draw_chat_tab(f, app, root_chunks[1]),
         }
     }
 
@@ -73,18 +74,41 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, regions: &mut LayoutRegions
     let header_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(22), // tabs
+            Constraint::Length(30), // tabs
             Constraint::Min(20),   // step progress / info
         ])
         .split(area);
 
-    // Compute per-tab hit rects inside the tabs area
-    let tabs_inner = header_chunks[0];
-    let tab_count = Tab::ALL.len() as u16;
-    let per_tab_w = if tab_count > 0 { tabs_inner.width / tab_count } else { 0 };
-    regions.tab_rects = (0..tab_count)
-        .map(|i| Rect::new(tabs_inner.x + i * per_tab_w, tabs_inner.y, per_tab_w, tabs_inner.height))
-        .collect();
+    // Compute per-tab hit rects matching ratatui Tabs rendering:
+    // Each tab renders as: [1 padding] title [1 padding] [divider]
+    // The block border takes 1 col on each side.
+    let tabs_outer = header_chunks[0];
+    let inner_x = tabs_outer.x + 1; // after left border
+    let inner_w = tabs_outer.width.saturating_sub(2); // minus both borders
+    let tab_count = Tab::ALL.len();
+    let divider_w: u16 = 1; // "│"
+    let padding: u16 = 1;   // ratatui Tabs default padding per side
+    {
+        let mut cur_x = inner_x;
+        regions.tab_rects.clear();
+        for (i, t) in Tab::ALL.iter().enumerate() {
+            let title_w = t.title().len() as u16;
+            let tab_w = padding + title_w + padding; // " title "
+            let full_w = if i < tab_count - 1 {
+                tab_w + divider_w // include divider in clickable area
+            } else {
+                // last tab: extend to fill remaining inner space
+                (inner_x + inner_w).saturating_sub(cur_x)
+            };
+            regions.tab_rects.push(Rect::new(
+                cur_x,
+                tabs_outer.y,
+                full_w,
+                tabs_outer.height,
+            ));
+            cur_x += full_w;
+        }
+    }
 
     // Tab selector
     let titles: Vec<Line> = Tab::ALL
@@ -430,6 +454,223 @@ fn draw_logs_tab(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(list, area);
 }
 
+// ── Chat Tab ────────────────────────────────────────────────────────────
+
+const CHAT_USER: Color = Color::Rgb(52, 211, 153);    // emerald for user
+const CHAT_AGENT: Color = Color::Rgb(96, 165, 250);   // blue for agent
+const CHAT_SYSTEM: Color = Color::Rgb(107, 114, 128); // dim gray for system
+// reserved: const CHAT_INPUT_BG: Color = Color::Rgb(30, 35, 44);
+
+fn draw_chat_tab(f: &mut Frame, app: &App, area: Rect) {
+    // Layout: banner (0-2) | messages (fill) | refactor prompt (0 or 3) | input (3) | status (1)
+    let has_banner = app.auto_mode;
+    let has_refactor = app.pending_refactor.is_some();
+    let banner_h = if has_banner { 1 } else { 0 };
+    let refactor_h: u16 = if has_refactor { 3 } else { 0 };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(banner_h),
+            Constraint::Min(5),
+            Constraint::Length(refactor_h),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    // Auto-mode banner
+    if app.auto_mode {
+        let banner = Paragraph::new(Line::from(Span::styled(
+            " ⚡ Auto mode: Agent will apply fixes automatically ",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center);
+        f.render_widget(banner, chunks[0]);
+    }
+
+    // Messages area
+    draw_chat_messages(f, app, chunks[1]);
+
+    // Pending refactor approve/reject prompt
+    if has_refactor {
+        let refactor_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(Span::styled(
+                " pending refactor ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        let prompt = Paragraph::new(Line::from(vec![
+            Span::styled(" Press ", Style::default().fg(TEXT_LIGHT)),
+            Span::styled("y", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled(" to apply │ ", Style::default().fg(TEXT_LIGHT)),
+            Span::styled("n", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(" to reject", Style::default().fg(TEXT_LIGHT)),
+        ]))
+        .block(refactor_block);
+        f.render_widget(prompt, chunks[2]);
+    }
+
+    // Input area
+    draw_chat_input(f, app, chunks[3]);
+
+    // Status bar
+    let status_style = if app.pending_refactor.is_some() {
+        Style::default().fg(Color::Yellow)
+    } else if app.daemon_connected {
+        Style::default().fg(GREEN)
+    } else {
+        Style::default().fg(Color::Red)
+    };
+    let thinking_indicator = if app.agent_thinking { " 🔄 thinking..." } else { "" };
+    let status_text = format!(
+        " {} │ {}{}",
+        app.chat_status,
+        app.daemon_socket.display(),
+        thinking_indicator,
+    );
+    let status = Paragraph::new(Line::from(Span::styled(status_text, status_style)));
+    f.render_widget(status, chunks[4]);
+}
+
+fn draw_chat_messages(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER))
+        .title(Span::styled(" agent chat ", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)));
+
+    if app.chat_messages.is_empty() && !app.daemon_connected {
+        let help_lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Agent chat is not connected.",
+                Style::default().fg(TEXT_DIM),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Start with built-in daemon:",
+                Style::default().fg(TEXT_DIM),
+            )),
+            Line::from(Span::styled(
+                "  ogtui --path runs/ --training-file train.py",
+                Style::default().fg(TEXT_LIGHT),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Or start daemon separately:",
+                Style::default().fg(TEXT_DIM),
+            )),
+            Line::from(Span::styled(
+                "  python3 -m og_agent_chat.server --training-file train.py",
+                Style::default().fg(TEXT_LIGHT),
+            )),
+        ];
+        let p = Paragraph::new(help_lines)
+            .block(block)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false });
+        f.render_widget(p, area);
+        return;
+    }
+
+    if app.chat_messages.is_empty() {
+        let msg = Paragraph::new(Line::from(Span::styled(
+            "No messages yet. Type a message and press Enter.",
+            Style::default().fg(TEXT_DIM),
+        )))
+        .block(block)
+        .alignment(Alignment::Center);
+        f.render_widget(msg, area);
+        return;
+    }
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Render messages as a scrollable list
+    let items: Vec<ListItem> = app
+        .chat_messages
+        .iter()
+        .map(|msg| {
+            let (prefix, color) = match msg.sender.as_str() {
+                "user" => ("You", CHAT_USER),
+                "agent" => ("Agent", CHAT_AGENT),
+                "system" => ("System", CHAT_SYSTEM),
+                other => (other, TEXT_DIM),
+            };
+
+            // Wrap long messages into multiple lines
+            let header = Line::from(vec![
+                Span::styled(
+                    format!("[{}] ", prefix),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]);
+
+            let content_lines: Vec<Line> = msg
+                .content
+                .lines()
+                .map(|l| {
+                    let style = if l.starts_with('+') && !l.starts_with("+++") {
+                        Style::default().fg(GREEN)
+                    } else if l.starts_with('-') && !l.starts_with("---") {
+                        Style::default().fg(Color::Red)
+                    } else if l.starts_with("@@") {
+                        Style::default().fg(Color::Cyan)
+                    } else if l.starts_with("---") || l.starts_with("+++") {
+                        Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(TEXT_LIGHT)
+                    };
+                    Line::from(Span::styled(format!("  {}", l), style))
+                })
+                .collect();
+
+            let mut all_lines = vec![header];
+            all_lines.extend(content_lines);
+            all_lines.push(Line::from("")); // spacing between messages
+
+            ListItem::new(all_lines)
+        })
+        .collect();
+
+    let list = List::new(items);
+    f.render_widget(list, inner);
+}
+
+fn draw_chat_input(f: &mut Frame, app: &App, area: Rect) {
+    let border_color = if app.chat_input_focused { GREEN } else { BORDER };
+    let title = if app.chat_input_focused {
+        " type message (Enter=send, Esc=unfocus) "
+    } else {
+        " press 'i' to type "
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(title, Style::default().fg(border_color)));
+
+    let display_text = if app.chat_input.is_empty() && !app.chat_input_focused {
+        "Type a message to the agent...".to_string()
+    } else if app.chat_input_focused {
+        format!("{}█", app.chat_input)
+    } else {
+        app.chat_input.clone()
+    };
+
+    let style = if app.chat_input.is_empty() && !app.chat_input_focused {
+        Style::default().fg(TEXT_DIM)
+    } else {
+        Style::default().fg(TEXT_LIGHT)
+    };
+
+    let input = Paragraph::new(Line::from(Span::styled(display_text, style)))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(input, area);
+}
+
 // ── Help Modal ──────────────────────────────────────────────────────────────
 
 fn draw_help_modal(f: &mut Frame, area: Rect) {
@@ -446,11 +687,16 @@ fn draw_help_modal(f: &mut Frame, area: Rect) {
         ("q", "Quit"),
         ("?", "Toggle this help"),
         ("Esc", "Close help / exit detail"),
-        ("j / ↓", "Scroll logs down"),
-        ("k / ↑", "Scroll logs up"),
+        ("j / ↓", "Scroll logs/chat down"),
+        ("k / ↑", "Scroll logs/chat up"),
         ("l / →", "Next metric"),
         ("h / ←", "Previous metric"),
         ("Enter / Click", "Enlarge metric"),
+        ("i", "Focus chat input"),
+        ("Enter (chat)", "Send message"),
+        ("Esc (chat)", "Unfocus chat input"),
+        ("y (chat)", "Apply pending refactor"),
+        ("n (chat)", "Reject pending refactor"),
     ];
 
     let lines: Vec<Line> = shortcuts
@@ -482,20 +728,39 @@ fn draw_help_modal(f: &mut Frame, area: Rect) {
 // ── Footer ──────────────────────────────────────────────────────────────────
 
 fn draw_footer(f: &mut Frame, _app: &App, area: Rect) {
-    let hints = Line::from(vec![
-        Span::styled("Tab", Style::default().fg(GREEN)),
-        Span::styled(" switch │ ", Style::default().fg(BORDER)),
-        Span::styled("?", Style::default().fg(GREEN)),
-        Span::styled(" help │ ", Style::default().fg(BORDER)),
-        Span::styled("q", Style::default().fg(GREEN)),
-        Span::styled(" quit │ ", Style::default().fg(BORDER)),
-        Span::styled("h/l", Style::default().fg(GREEN)),
-        Span::styled(" metrics │ ", Style::default().fg(BORDER)),
-        Span::styled("j/k", Style::default().fg(GREEN)),
-        Span::styled(" scroll", Style::default().fg(BORDER)),
-        Span::raw("    "),
-        Span::styled("opengraphs", Style::default().fg(BORDER)),
-    ]);
+    let hints = if _app.active_tab == Tab::Chat {
+        Line::from(vec![
+            Span::styled("Tab", Style::default().fg(GREEN)),
+            Span::styled(" switch │ ", Style::default().fg(BORDER)),
+            Span::styled("i", Style::default().fg(GREEN)),
+            Span::styled(" type │ ", Style::default().fg(BORDER)),
+            Span::styled("Enter", Style::default().fg(GREEN)),
+            Span::styled(" send │ ", Style::default().fg(BORDER)),
+            Span::styled("j/k", Style::default().fg(GREEN)),
+            Span::styled(" scroll │ ", Style::default().fg(BORDER)),
+            Span::styled("?", Style::default().fg(GREEN)),
+            Span::styled(" help │ ", Style::default().fg(BORDER)),
+            Span::styled("q", Style::default().fg(GREEN)),
+            Span::styled(" quit", Style::default().fg(BORDER)),
+            Span::raw("    "),
+            Span::styled("opengraphs", Style::default().fg(BORDER)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("Tab", Style::default().fg(GREEN)),
+            Span::styled(" switch │ ", Style::default().fg(BORDER)),
+            Span::styled("?", Style::default().fg(GREEN)),
+            Span::styled(" help │ ", Style::default().fg(BORDER)),
+            Span::styled("q", Style::default().fg(GREEN)),
+            Span::styled(" quit │ ", Style::default().fg(BORDER)),
+            Span::styled("h/l", Style::default().fg(GREEN)),
+            Span::styled(" metrics │ ", Style::default().fg(BORDER)),
+            Span::styled("j/k", Style::default().fg(GREEN)),
+            Span::styled(" scroll", Style::default().fg(BORDER)),
+            Span::raw("    "),
+            Span::styled("opengraphs", Style::default().fg(BORDER)),
+        ])
+    };
 
     let footer = Paragraph::new(hints).alignment(Alignment::Right);
     f.render_widget(footer, area);

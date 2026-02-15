@@ -1,27 +1,32 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::socket_client::{ActionPlanResponse, ChatMessage};
+
 /// Which tab is currently active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Graphs,
     Logs,
+    Chat,
 }
 
 impl Tab {
-    pub const ALL: &[Tab] = &[Tab::Graphs, Tab::Logs];
+    pub const ALL: &[Tab] = &[Tab::Graphs, Tab::Logs, Tab::Chat];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Graphs => "graphs",
             Tab::Logs => "logs",
+            Tab::Chat => "chat",
         }
     }
 
     pub fn next(self) -> Tab {
         match self {
             Tab::Graphs => Tab::Logs,
-            Tab::Logs => Tab::Graphs,
+            Tab::Logs => Tab::Chat,
+            Tab::Chat => Tab::Graphs,
         }
     }
 }
@@ -57,6 +62,28 @@ pub struct App {
     pub total_events: usize,
     /// Total steps (max step value)
     pub max_step: i64,
+
+    // ── Agent chat state ─────────────────────────────────────────────────
+    /// Chat messages from the daemon
+    pub chat_messages: Vec<ChatMessage>,
+    /// Current input buffer for the chat
+    pub chat_input: String,
+    /// Scroll offset in the chat message list
+    pub chat_scroll: u16,
+    /// Whether the chat input is focused (typing mode)
+    pub chat_input_focused: bool,
+    /// Whether the agent is currently processing
+    pub agent_thinking: bool,
+    /// Whether the daemon is connected
+    pub daemon_connected: bool,
+    /// Socket path for the daemon
+    pub daemon_socket: PathBuf,
+    /// Status message shown in chat footer
+    pub chat_status: String,
+    /// Auto-mode flag from daemon
+    pub auto_mode: bool,
+    /// Pending refactor plan awaiting user approval (non-auto mode)
+    pub pending_refactor: Option<ActionPlanResponse>,
 }
 
 impl App {
@@ -68,6 +95,7 @@ impl App {
         max_step: i64,
     ) -> Self {
         let tags: Vec<String> = scalars.keys().cloned().collect();
+        let daemon_socket = crate::socket_client::socket_path();
         Self {
             active_tab: Tab::Graphs,
             scalars,
@@ -84,6 +112,16 @@ impl App {
             metrics_cols: 4,
             total_events,
             max_step,
+            chat_messages: Vec::new(),
+            chat_input: String::new(),
+            chat_scroll: 0,
+            chat_input_focused: false,
+            agent_thinking: false,
+            daemon_connected: false,
+            daemon_socket,
+            chat_status: "Disconnected".to_string(),
+            auto_mode: false,
+            pending_refactor: None,
         }
     }
 
@@ -163,5 +201,37 @@ impl App {
 
     pub fn unfocus_metric(&mut self) {
         self.focused_metric = None;
+    }
+
+    // ── Chat methods ────────────────────────────────────────────────────
+
+    pub fn chat_input_push(&mut self, c: char) {
+        self.chat_input.push(c);
+    }
+
+    pub fn chat_input_pop(&mut self) {
+        self.chat_input.pop();
+    }
+
+    pub fn chat_input_take(&mut self) -> String {
+        std::mem::take(&mut self.chat_input)
+    }
+
+    pub fn scroll_chat_down(&mut self) {
+        let max = self.chat_messages.len().saturating_sub(1) as u16;
+        self.chat_scroll = (self.chat_scroll + 1).min(max);
+    }
+
+    pub fn scroll_chat_up(&mut self) {
+        self.chat_scroll = self.chat_scroll.saturating_sub(1);
+    }
+
+    pub fn update_chat_messages(&mut self, messages: Vec<ChatMessage>) {
+        self.chat_messages = messages;
+        // Auto-scroll to bottom
+        let len = self.chat_messages.len();
+        if len > 0 {
+            self.chat_scroll = len.saturating_sub(1) as u16;
+        }
     }
 }
