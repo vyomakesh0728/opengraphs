@@ -2,7 +2,6 @@ target/
 **/target/
 
 node_modules/
-apps/tui/node_modules/
 
 .venv/
 python/**/.venv/
@@ -11,3 +10,16 @@ dist/
 coverage/
 
 .DS_Store
+
+# Python caches
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Lockfiles
+uv.lock
+**/uv.lock
+
+# Agent checkpoints
+.og_checkpoints/
+python/agent-chat/og_agent_chat.egg-info/

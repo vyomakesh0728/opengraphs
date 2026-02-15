@@ -1,3 +1,12 @@
+Metadata-Version: 2.4
+Name: opengraphs
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: dspy>=3.1.3
+Requires-Dist: og-agent-chat
+
 <p align="center">
     <img src="screenshots/Opengraphs%20logo%20with%20terminal%20icon.png" alt="OpenGraphs logo" width="900" />
 </p>

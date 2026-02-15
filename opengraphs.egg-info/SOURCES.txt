@@ -1,0 +1,7 @@
+README.md
+pyproject.toml
+opengraphs.egg-info/PKG-INFO
+opengraphs.egg-info/SOURCES.txt
+opengraphs.egg-info/dependency_links.txt
+opengraphs.egg-info/requires.txt
+opengraphs.egg-info/top_level.txt
