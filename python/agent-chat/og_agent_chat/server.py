@@ -5,7 +5,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import shlex
 import stat
 import sys
@@ -99,51 +98,6 @@ def _resolve_run_dir(path: Path | None) -> Path | None:
     return path
 
 
-def _demo_loop_reset_enabled(config: DaemonConfig) -> bool:
-    if not config.auto_mode:
-        return False
-    if config.training_file.name != "demo_train.py":
-        return False
-    toggle = os.getenv("OG_DEMO_LOOP_RESET", "1").strip().lower()
-    return toggle not in {"0", "false", "no", "off"}
-
-
-def _reset_demo_training_file(training_file: Path) -> bool:
-    try:
-        text = training_file.read_text(encoding="utf-8")
-    except OSError:
-        return False
-
-    updated = text
-    updated = re.sub(
-        r'LEARNING_RATE\s*=\s*float\(os\.getenv\("DEMO_LR",\s*"[^"]*"\)\)',
-        'LEARNING_RATE = float(os.getenv("DEMO_LR", "0.008"))',
-        updated,
-        count=1,
-    )
-    updated = re.sub(
-        r"WARMUP_STEPS\s*=\s*\d+",
-        "WARMUP_STEPS = 3",
-        updated,
-        count=1,
-    )
-    updated = re.sub(
-        r"PEAK_LR_MULT\s*=\s*[0-9]*\.?[0-9]+",
-        "PEAK_LR_MULT = 4.0",
-        updated,
-        count=1,
-    )
-
-    if updated == text:
-        return False
-
-    try:
-        training_file.write_text(updated, encoding="utf-8")
-    except OSError:
-        return False
-    return True
-
-
 async def serve(config: DaemonConfig) -> None:
     run_state = RunState(
         training_file=config.training_file,
@@ -162,22 +116,6 @@ async def serve(config: DaemonConfig) -> None:
             run_state.append_log(line.decode("utf-8", errors="replace").rstrip("\n"))
         return_code = await process.wait()
         run_state.append_log(f"[system] training exited with code {return_code}")
-        if return_code == 0 and _demo_loop_reset_enabled(config):
-            if _reset_demo_training_file(run_state.training_file):
-                msg = (
-                    "[system] demo loop reset: restored demo_train.py to bad defaults "
-                    "(DEMO_LR=0.008, WARMUP_STEPS=3, PEAK_LR_MULT=4.0)"
-                )
-                run_state.append_log(msg)
-                try:
-                    agent.add_chat_message(
-                        "system",
-                        "Demo loop reset complete: script restored to intentionally bad defaults "
-                        "for the next run.",
-                    )
-                except Exception:
-                    # Keep log streaming resilient even if chat append fails.
-                    pass
 
     async def _stop_training_process() -> None:
         nonlocal training_process, training_log_task
