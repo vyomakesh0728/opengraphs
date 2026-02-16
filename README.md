@@ -10,6 +10,14 @@ Local-first, TUI-native experiment tracking for AI runs over SSH.
 [![GitHub Downloads](https://img.shields.io/github/downloads/vyomakesh0728/opengraphs/total?style=flat-square)](https://github.com/vyomakesh0728/opengraphs/releases)
 [![Rust](https://img.shields.io/badge/rust-first-orange?style=flat-square)](https://www.rust-lang.org/)
 
+## Demo
+
+- Video: [Kapture 2026-02-16 at 11.41.29](screenshots/Kapture%202026-02-16%20at%2011.41.29.mp4)
+
+<p align="center">
+    <img src="screenshots/Screenshot%201947-11-27%20at%2011.42.20%E2%80%AFAM.png" alt="OpenGraphs demo screenshot" width="900" />
+</p>
+
 ## Why this exists
 
 Browser dashboards and port forwarding are painful on remote GPU boxes. `opengraphs` is built for terminal-native workflows:
