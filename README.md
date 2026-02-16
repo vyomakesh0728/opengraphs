@@ -14,8 +14,7 @@ Local-first, TUI-native experiment tracking for AI runs over SSH.
 
 - Video:
 
-[![Watch Demo Video](screenshots/Screenshot%201947-11-27%20at%2011.42.20%E2%80%AFAM.png)](https://github.com/vyomakesh0728/opengraphs/raw/main/screenshots/Kapture%202026-02-16%20at%2011.41.29.mp4)
-</p>
+**[▶️ Watch Demo Video](https://github.com/vyomakesh0728/opengraphs/raw/main/screenshots/Kapture%202026-02-16%20at%2011.41.29.mp4)** (Click to download/play)
 
 ## Why this exists
 
