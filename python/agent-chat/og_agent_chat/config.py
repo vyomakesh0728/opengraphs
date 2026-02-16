@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 def _ensure_deno_dir() -> None:
@@ -12,12 +12,19 @@ def _ensure_deno_dir() -> None:
     os.environ.setdefault("DENO_DIR", str(deno_dir))
 
 
-_ensure_deno_dir()
-
-import dspy
-
 _DEFAULT_MODEL = "openai/gpt-5.2-codex"
-_configured_lm: Optional[dspy.LM] = None
+_configured_lm: Optional[Any] = None
+_dspy_module: Any | None = None
+
+
+def get_dspy() -> Any:
+    global _dspy_module
+    if _dspy_module is None:
+        _ensure_deno_dir()
+        import dspy as _dspy
+
+        _dspy_module = _dspy
+    return _dspy_module
 
 
 def _sanitize_api_key(value: str | None) -> str | None:
@@ -38,10 +45,11 @@ def ensure_dspy_configured(
     api_key: str | None = None,
     api_base: str | None = None,
     model_type: str | None = None,
-) -> dspy.LM:
+) -> Any:
     global _configured_lm
     if _configured_lm is not None and model is None:
         return _configured_lm
+    dspy = get_dspy()
 
     model_name = model or os.getenv("OG_AGENT_MODEL", _DEFAULT_MODEL)
     api_key = _sanitize_api_key(api_key or os.getenv("OG_AGENT_API_KEY"))

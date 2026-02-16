@@ -19,6 +19,7 @@ __pycache__/
 # Lockfiles
 uv.lock
 **/uv.lock
+apps/promo/package-lock.json
 
 # Agent checkpoints
 .og_checkpoints/

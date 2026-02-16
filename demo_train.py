@@ -13,13 +13,17 @@ except Exception:
     psutil = None
 
 # ── Hyperparameters ──────────────────────────────────────────────────────
-# Intentionally bad default for auto-fix demos; agent should lower this to 0.001.
-LEARNING_RATE = float(os.getenv("DEMO_LR", "0.008"))
+# Intentionally bad defaults for the demo run:
+# 1) base LR is too high
+# 2) warmup is too short
+# 3) LR jumps too high after warmup
+# 4) batch is too small (extra noisy updates)
+LEARNING_RATE = float(os.getenv("DEMO_LR", "0.001"))
 TOTAL_STEPS = 100
-BATCH_SIZE = 32
+BATCH_SIZE = int(os.getenv("DEMO_BATCH", "32"))
 SLEEP_PER_STEP = 0.3
-WARMUP_STEPS = 3
-PEAK_LR_MULT = 4.0
+WARMUP_STEPS = 20
+PEAK_LR_MULT = 1.0
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -88,21 +92,25 @@ def cpu_stats():
 
 # ── Training loop ────────────────────────────────────────────────────────
 #
-# This demo intentionally uses a bad schedule config:
-# - tiny warmup
-# - very high post-warmup LR multiplier
-# Together with a high base LR, this causes post-warmup divergence.
-# The intended fix is to lower base LEARNING_RATE from 0.008 -> 0.001.
+# This demo intentionally starts unstable so the assistant has something to fix.
+# The most important fixes are:
+# - LEARNING_RATE: 0.008 -> 0.001
+# - WARMUP_STEPS: 3 -> 20
+# - PEAK_LR_MULT: 4.0 -> 1.0
+# Optional quality-of-life fix for cleaner curves:
+# - BATCH_SIZE: 8 -> 32
 
 def scheduled_lr(step, base_lr):
     if step <= WARMUP_STEPS:
         return base_lr * (0.2 + 0.8 * step / max(1, WARMUP_STEPS))
-    # Misconfigured schedule floor keeps LR overly high after warmup.
+    # Keep LR too high after warmup on purpose.
     return base_lr * PEAK_LR_MULT
 
 def train():
     lr = LEARNING_RATE
     writer = get_tb_writer()
+    small_batch = BATCH_SIZE < 16
+    noise_std = 0.05 if small_batch else 0.02
 
     print(f"[info] starting training: lr={lr}, steps={TOTAL_STEPS}, batch={BATCH_SIZE}")
     sys.stdout.flush()
@@ -113,29 +121,32 @@ def train():
         psutil.cpu_percent(interval=None)
 
     for step in range(1, TOTAL_STEPS + 1):
-        noise = random.gauss(0, 0.02)
+        noise = random.gauss(0, noise_std)
         eff_lr = scheduled_lr(step, lr)
 
         if eff_lr >= 0.005:
-            # Effective LR too high: loss drops initially then drifts upward
+            # LR is too high: short early improvement, then instability.
             if step <= 25:
                 decay = math.exp(-eff_lr * step * 0.8)
                 loss = 2.5 * decay + noise
-                acc = min(0.60, 0.10 + (1 - decay) * 0.50 + noise * 0.5)
+                acc = min(0.60, 0.10 + (1 - decay) * 0.50 + noise * 0.35)
             else:
-                loss = loss + 0.02 + random.gauss(0, 0.03)
-                acc = acc - 0.002 + random.gauss(0, 0.004)
+                loss = loss + (0.03 if small_batch else 0.02) + random.gauss(0, 0.03)
+                acc = acc - (0.003 if small_batch else 0.002) + random.gauss(0, 0.004)
         else:
-            # Good effective LR: smooth convergence
+            # Stable LR: converges more smoothly.
             decay = math.exp(-eff_lr * step * 3.0)
-            loss = 2.5 * decay + noise * 0.5
-            acc = min(0.95, 0.10 + (1 - decay) * 0.85 + noise * 0.3)
+            loss = 2.5 * decay + noise * 0.45
+            acc = min(0.95, 0.10 + (1 - decay) * 0.85 + noise * 0.25)
+            if BATCH_SIZE < 16:
+                # Keep an obvious "not fully stable" signal when batch is tiny.
+                acc = min(acc, 0.88)
 
         loss = max(0.01, loss)
         acc = max(0.0, min(1.0, acc))
-        grad_norm = abs(random.gauss(0.5, 0.2))
+        grad_norm = abs(random.gauss(0.5, 0.25 if small_batch else 0.2))
         if eff_lr >= 0.005 and step > 25:
-            grad_norm += random.uniform(0.3, 0.8)
+            grad_norm += random.uniform(0.5, 0.9) if small_batch else random.uniform(0.3, 0.8)
         throughput = BATCH_SIZE / (SLEEP_PER_STEP + random.uniform(0, 0.05))
 
         report("train/loss", loss, step)
