@@ -16,10 +16,6 @@ Local-first, TUI-native experiment tracking for AI runs over SSH.
     <img src="screenshots/Kapture%202026-02-16%20at%2011.41.29.gif" alt="OpenGraphs demo GIF" width="900" />
 </p>
 
-<p align="center">
-    <img src="screenshots/demo-agent-chat-screenshot.png" alt="OpenGraphs agent chat screenshot" width="900" />
-</p>
-
 - Video (MP4): [Kapture 2026-02-16 at 11.41.29](screenshots/Kapture%202026-02-16%20at%2011.41.29.mp4)
 
 ## Why this exists
