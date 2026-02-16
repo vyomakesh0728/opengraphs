@@ -12,9 +12,9 @@ Local-first, TUI-native experiment tracking for AI runs over SSH.
 
 ## Demo
 
-- Video: [Kapture 2026-02-16 at 11.41.29](screenshots/Kapture%202026-02-16%20at%2011.41.29.mp4)
+- Video:
 
-<p align="center">
+<video src="screenshots/Kapture 2026-02-16 at 11.41.29.mp4" controls width="100%" style="max-width:900px"></video><p align="center">
     <img src="screenshots/Screenshot%201947-11-27%20at%2011.42.20%E2%80%AFAM.png" alt="OpenGraphs demo screenshot" width="900" />
 </p>
 
