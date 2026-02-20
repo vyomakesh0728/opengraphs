@@ -17,7 +17,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use app::App;
+use app::{App, ProcessSnapshot, ProcessSort};
 
 /// opengraphs TUI — terminal-native experiment tracking viewer
 #[derive(Parser)]
@@ -58,6 +58,18 @@ struct Cli {
     /// Refresh interval for live reload in milliseconds (0 disables live reload)
     #[arg(long, default_value_t = 1000)]
     refresh_ms: u64,
+
+    /// Sort key used in the procs tab
+    #[arg(long = "procs-sort", value_enum, default_value = "cpu")]
+    procs_sort: ProcessSort,
+
+    /// Process sampling interval in milliseconds (0 disables process polling)
+    #[arg(long = "procs-interval-ms", default_value_t = 1000)]
+    procs_interval_ms: u64,
+
+    /// Maximum number of running/exited processes retained in the procs tab
+    #[arg(long = "procs-limit", default_value_t = 300)]
+    procs_limit: usize,
 }
 
 struct ViewData {
@@ -103,6 +115,7 @@ fn main() -> Result<()> {
         initial.total_events,
         initial.max_step,
     );
+    app.set_process_preferences(cli.procs_sort, cli.procs_limit);
 
     // Override socket path if provided
     if let Some(ref sock) = cli.socket {
@@ -144,7 +157,13 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, app, &cli.path, cli.refresh_ms);
+    let result = run_app(
+        &mut terminal,
+        app,
+        &cli.path,
+        cli.refresh_ms,
+        cli.procs_interval_ms,
+    );
 
     // ── Restore terminal ────────────────────────────────────────────────
     disable_raw_mode()?;
@@ -234,6 +253,94 @@ fn find_python() -> String {
         }
     }
     "python3".to_string()
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn parse_process_line(line: &str) -> Option<ProcessSnapshot> {
+    let mut fields = line.split_whitespace();
+    let pid_s = fields.next()?;
+    let ppid_s = fields.next()?;
+    let state_s = fields.next()?;
+    let elapsed_s = fields.next()?;
+    let cpu_s = fields.next()?;
+    let mem_s = fields.next()?;
+    let command = fields.collect::<Vec<_>>().join(" ");
+    if command.is_empty() {
+        return None;
+    }
+
+    let pid = pid_s.parse::<i32>().ok()?;
+    let ppid = ppid_s.parse::<i32>().ok()?;
+    let elapsed_secs = parse_elapsed_secs(elapsed_s).unwrap_or(0);
+    let cpu_pct = cpu_s.parse::<f32>().unwrap_or(0.0);
+    let mem_pct = mem_s.parse::<f32>().unwrap_or(0.0);
+
+    Some(ProcessSnapshot {
+        pid,
+        ppid,
+        state: state_s.to_string(),
+        elapsed: elapsed_s.to_string(),
+        elapsed_secs,
+        cpu_pct,
+        mem_pct,
+        command,
+    })
+}
+
+fn parse_elapsed_secs(etime: &str) -> Option<u64> {
+    let (days, clock) = match etime.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, etime),
+    };
+
+    let parts: Vec<u64> = clock
+        .split(':')
+        .map(|p| p.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+
+    let clock_secs = match parts.as_slice() {
+        [mm, ss] => mm.saturating_mul(60).saturating_add(*ss),
+        [hh, mm, ss] => hh
+            .saturating_mul(3600)
+            .saturating_add(mm.saturating_mul(60))
+            .saturating_add(*ss),
+        [ss] => *ss,
+        _ => return None,
+    };
+
+    Some(days.saturating_mul(86_400).saturating_add(clock_secs))
+}
+
+fn sample_processes() -> Result<Vec<ProcessSnapshot>> {
+    let output = Command::new("ps")
+        .args(["-x", "-o", "pid=,ppid=,state=,etime=,%cpu=,%mem=,command="])
+        .output()
+        .with_context(|| "sampling process list with ps".to_string())?;
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!("ps failed with status {}", output.status));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut processes: Vec<ProcessSnapshot> = Vec::new();
+
+    for raw in stdout.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(process) = parse_process_line(line) {
+            processes.push(process);
+        }
+    }
+
+    Ok(processes)
 }
 
 fn tail_overlap(previous: &[String], current: &[String]) -> usize {
@@ -389,6 +496,7 @@ fn run_app<B: Backend>(
     mut app: App,
     events_path: &Path,
     refresh_ms: u64,
+    procs_interval_ms: u64,
 ) -> Result<()> {
     // Track layout regions for mouse hit-testing
     let mut layout = ui::LayoutRegions::default();
@@ -401,6 +509,9 @@ fn run_app<B: Backend>(
     // Periodic polling state
     let mut last_poll = Instant::now();
     let poll_interval = Duration::from_millis(500);
+    let process_poll_interval =
+        (procs_interval_ms > 0).then(|| Duration::from_millis(procs_interval_ms));
+    let mut last_process_poll = Instant::now();
     let tick_rate = Duration::from_millis(100);
 
     // Initial daemon connection check
@@ -423,7 +534,22 @@ fn run_app<B: Backend>(
         });
     }
 
+    if process_poll_interval.is_some() {
+        if let Ok(processes) = sample_processes() {
+            app.update_processes(processes, unix_now_secs());
+        }
+    }
+
     loop {
+        if let Some(interval) = process_poll_interval {
+            if last_process_poll.elapsed() >= interval {
+                if let Ok(processes) = sample_processes() {
+                    app.update_processes(processes, unix_now_secs());
+                }
+                last_process_poll = Instant::now();
+            }
+        }
+
         if let Some(interval) = refresh_interval {
             if last_refresh.elapsed() >= interval {
                 if let Ok(updated) = load_view_data(events_path) {
@@ -781,11 +907,13 @@ fn run_app<B: Backend>(
                     KeyCode::Char('j') | KeyCode::Down => match app.active_tab {
                         app::Tab::Graphs => app.scroll_metrics_down(),
                         app::Tab::Logs => app.scroll_logs_down(),
+                        app::Tab::Processes => app.scroll_processes_down(),
                         app::Tab::Chat => app.scroll_chat_down(),
                     },
                     KeyCode::Char('k') | KeyCode::Up => match app.active_tab {
                         app::Tab::Graphs => app.scroll_metrics_up(),
                         app::Tab::Logs => app.scroll_logs_up(),
+                        app::Tab::Processes => app.scroll_processes_up(),
                         app::Tab::Chat => app.scroll_chat_up(),
                     },
                     KeyCode::Char('l') | KeyCode::Right => app.next_metric(),
@@ -878,11 +1006,13 @@ fn run_app<B: Backend>(
                     MouseEventKind::ScrollDown => match app.active_tab {
                         app::Tab::Graphs => app.scroll_metrics_down(),
                         app::Tab::Logs => app.scroll_logs_down(),
+                        app::Tab::Processes => app.scroll_processes_down(),
                         app::Tab::Chat => app.scroll_chat_down(),
                     },
                     MouseEventKind::ScrollUp => match app.active_tab {
                         app::Tab::Graphs => app.scroll_metrics_up(),
                         app::Tab::Logs => app.scroll_logs_up(),
+                        app::Tab::Processes => app.scroll_processes_up(),
                         app::Tab::Chat => app.scroll_chat_up(),
                     },
                     _ => {}
@@ -895,7 +1025,7 @@ fn run_app<B: Backend>(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_live_log_line, tail_overlap};
+    use super::{normalize_live_log_line, parse_elapsed_secs, parse_process_line, tail_overlap};
 
     #[test]
     fn tail_overlap_handles_sliding_windows() {
@@ -948,5 +1078,31 @@ mod tests {
             normalize_live_log_line(line),
             Some("[important] val/loss crossed threshold".to_string())
         );
+    }
+
+    #[test]
+    fn parse_process_line_parses_valid_ps_row() {
+        let line = "1234 1 R 00:12 34.5 12.3 python train.py --epochs 10";
+        let parsed = parse_process_line(line).expect("expected valid process row");
+        assert_eq!(parsed.pid, 1234);
+        assert_eq!(parsed.ppid, 1);
+        assert_eq!(parsed.state, "R");
+        assert_eq!(parsed.elapsed, "00:12");
+        assert_eq!(parsed.elapsed_secs, 12);
+        assert!((parsed.cpu_pct - 34.5).abs() < 0.001);
+        assert!((parsed.mem_pct - 12.3).abs() < 0.001);
+        assert_eq!(parsed.command, "python train.py --epochs 10");
+    }
+
+    #[test]
+    fn parse_process_line_rejects_incomplete_row() {
+        let line = "1234 1 R 00:12";
+        assert!(parse_process_line(line).is_none());
+    }
+
+    #[test]
+    fn parse_elapsed_secs_handles_day_hour_format() {
+        assert_eq!(parse_elapsed_secs("1-02:03:04"), Some(93_784));
+        assert_eq!(parse_elapsed_secs("04:05"), Some(245));
     }
 }

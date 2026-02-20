@@ -1,3 +1,6 @@
+use std::cmp::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -7,7 +10,7 @@ use ratatui::{
     widgets::{Axis, Block, Borders, Chart, Clear, Dataset, GraphType, Paragraph, Tabs, Wrap},
 };
 
-use crate::app::{App, Tab};
+use crate::app::{App, ProcessSort, Tab};
 
 // ── Colors (matching the TypeScript TUI) ────────────────────────────────────
 const GREEN: Color = Color::Rgb(46, 204, 113); // #2ecc71
@@ -54,6 +57,7 @@ pub fn draw(f: &mut Frame, app: &mut App) -> LayoutRegions {
         match app.active_tab {
             Tab::Graphs => draw_graphs_tab(f, app, root_chunks[1], &mut regions),
             Tab::Logs => draw_logs_tab(f, app, root_chunks[1]),
+            Tab::Processes => draw_processes_tab(f, app, root_chunks[1]),
             Tab::Chat => draw_chat_tab(f, app, root_chunks[1]),
         }
     }
@@ -71,11 +75,21 @@ pub fn draw(f: &mut Frame, app: &mut App) -> LayoutRegions {
 // ── Header ──────────────────────────────────────────────────────────────────
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect, regions: &mut LayoutRegions) {
+    // Keep the tab box tight to exactly the visible tab labels.
+    let tab_padding: u16 = 1; // ratatui Tabs default padding per side
+    let tab_divider_w: u16 = 1; // "│"
+    let labels_w: u16 = Tab::ALL
+        .iter()
+        .map(|t| (t.title().len() as u16) + (tab_padding * 2))
+        .sum();
+    let dividers_w = tab_divider_w.saturating_mul(Tab::ALL.len().saturating_sub(1) as u16);
+    let tabs_required_w = labels_w.saturating_add(dividers_w).saturating_add(2); // block left/right borders
+
     let header_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(30), // tabs
-            Constraint::Min(20),    // step progress / info
+            Constraint::Length(tabs_required_w), // tabs (tight fit)
+            Constraint::Min(12),                 // step progress / info
         ])
         .split(area);
 
@@ -86,8 +100,8 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, regions: &mut LayoutRegions
     let inner_x = tabs_outer.x + 1; // after left border
     let inner_w = tabs_outer.width.saturating_sub(2); // minus both borders
     let tab_count = Tab::ALL.len();
-    let divider_w: u16 = 1; // "│"
-    let padding: u16 = 1; // ratatui Tabs default padding per side
+    let divider_w: u16 = tab_divider_w;
+    let padding: u16 = tab_padding;
     {
         let mut cur_x = inner_x;
         regions.tab_rects.clear();
@@ -480,6 +494,212 @@ fn draw_logs_tab(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
+// ── Processes Tab ───────────────────────────────────────────────────────────
+
+fn state_style(state: &str) -> Style {
+    let first = state.chars().next().unwrap_or('S');
+    match first {
+        'R' => Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+        'D' | 'Z' => Style::default().fg(LOG_ERROR).add_modifier(Modifier::BOLD),
+        'T' => Style::default().fg(LOG_IMPORTANT),
+        _ => Style::default().fg(TEXT_DIM),
+    }
+}
+
+fn state_label(state: &str) -> &'static str {
+    match state.chars().next().unwrap_or('S') {
+        'R' => "running",
+        'S' => "sleeping",
+        'D' => "io-wait",
+        'T' => "stopped",
+        'Z' => "zombie",
+        'I' => "idle",
+        _ => "other",
+    }
+}
+
+fn truncate_text(input: &str, max_len: usize) -> String {
+    if max_len == 0 {
+        return String::new();
+    }
+    let count = input.chars().count();
+    if count <= max_len {
+        return input.to_string();
+    }
+    if max_len <= 3 {
+        return ".".repeat(max_len);
+    }
+    let keep = max_len - 3;
+    let mut out = String::new();
+    for ch in input.chars().take(keep) {
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn format_ago(delta_secs: u64) -> String {
+    if delta_secs < 60 {
+        format!("{}s ago", delta_secs)
+    } else if delta_secs < 3600 {
+        format!("{}m ago", delta_secs / 60)
+    } else if delta_secs < 86400 {
+        format!("{}h ago", delta_secs / 3600)
+    } else {
+        format!("{}d ago", delta_secs / 86400)
+    }
+}
+
+fn draw_processes_tab(f: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER))
+        .title(Span::styled(" processes ", Style::default().fg(BORDER)));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width < 10 || inner.height < 3 {
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    let line_width = inner.width.saturating_sub(2) as usize;
+
+    let mut running = app.running_processes.clone();
+    running.sort_by(|a, b| match app.process_sort {
+        ProcessSort::Cpu => b
+            .cpu_pct
+            .partial_cmp(&a.cpu_pct)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| b.mem_pct.partial_cmp(&a.mem_pct).unwrap_or(Ordering::Equal))
+            .then_with(|| a.pid.cmp(&b.pid)),
+        ProcessSort::Mem => b
+            .mem_pct
+            .partial_cmp(&a.mem_pct)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap_or(Ordering::Equal))
+            .then_with(|| a.pid.cmp(&b.pid)),
+        ProcessSort::Pid => a
+            .pid
+            .cmp(&b.pid)
+            .then_with(|| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap_or(Ordering::Equal)),
+        ProcessSort::Etime => b
+            .elapsed_secs
+            .cmp(&a.elapsed_secs)
+            .then_with(|| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap_or(Ordering::Equal))
+            .then_with(|| a.pid.cmp(&b.pid)),
+    });
+
+    let high_cpu = running.iter().filter(|p| p.cpu_pct >= 25.0).count();
+    let zombies = running.iter().filter(|p| p.state.starts_with('Z')).count();
+    let running_total = running.len();
+    running.truncate(app.process_limit);
+    let running_shown = running.len();
+
+    lines.push(Line::from(Span::styled(
+        format!(
+            "live processes: {} running | {} high-cpu | {} zombie",
+            running_total, high_cpu, zombies
+        ),
+        Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "sorted by {} | showing {}",
+            app.process_sort.label(),
+            running_shown
+        ),
+        Style::default().fg(BORDER),
+    )));
+
+    if running.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no running processes captured yet)",
+            Style::default().fg(TEXT_DIM),
+        )));
+    } else {
+        for p in &running {
+            let style = state_style(&p.state);
+            let row = truncate_text(
+                &format!(
+                    "[{}] {} | up {} | cpu {:>5.1}% | mem {:>4.1}% | ppid {}",
+                    p.pid,
+                    state_label(&p.state),
+                    p.elapsed,
+                    p.cpu_pct,
+                    p.mem_pct,
+                    p.ppid
+                ),
+                line_width,
+            );
+            lines.push(Line::from(Span::styled(row, style)));
+            let cmd = truncate_text(&format!("  {}", p.command), line_width);
+            lines.push(Line::from(Span::styled(
+                cmd,
+                Style::default().fg(TEXT_LIGHT),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("recently exited ({})", app.exited_processes.len()),
+        Style::default()
+            .fg(LOG_IMPORTANT)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        "newest first",
+        Style::default().fg(BORDER),
+    )));
+
+    if app.exited_processes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no exited processes observed yet)",
+            Style::default().fg(TEXT_DIM),
+        )));
+    } else {
+        let now = unix_now_secs();
+        for p in &app.exited_processes {
+            let ago = format_ago(now.saturating_sub(p.exited_at_unix));
+            let row = truncate_text(
+                &format!(
+                    "[{}] exited {} | was {} | up {} | cpu {:>5.1}% | mem {:>4.1}%",
+                    p.snapshot.pid,
+                    ago,
+                    state_label(&p.snapshot.state),
+                    p.snapshot.elapsed,
+                    p.snapshot.cpu_pct,
+                    p.snapshot.mem_pct
+                ),
+                line_width,
+            );
+            lines.push(Line::from(Span::styled(row, Style::default().fg(TEXT_DIM))));
+            let cmd = truncate_text(&format!("  {}", p.snapshot.command), line_width);
+            lines.push(Line::from(Span::styled(
+                cmd,
+                Style::default().fg(TEXT_LIGHT),
+            )));
+        }
+    }
+
+    app.set_processes_viewport_rows(inner.height as usize);
+    app.set_processes_total_rows(lines.len());
+
+    let paragraph = Paragraph::new(lines)
+        .scroll((app.processes_scroll, 0))
+        .wrap(Wrap { trim: false });
+    f.render_widget(paragraph, inner);
+}
+
 // ── Chat Tab ────────────────────────────────────────────────────────────
 
 const CHAT_USER: Color = Color::Rgb(52, 211, 153); // emerald for user
@@ -729,8 +949,8 @@ fn draw_help_modal(f: &mut Frame, area: Rect) {
         ("?", "Toggle this help"),
         ("F6", "Toggle copy mode (highlight/copy text with mouse)"),
         ("Esc", "Close help / exit detail"),
-        ("j / ↓", "Scroll logs/chat down"),
-        ("k / ↑", "Scroll logs/chat up"),
+        ("j / ↓", "Scroll logs/procs/chat down"),
+        ("k / ↑", "Scroll logs/procs/chat up"),
         ("l / →", "Next metric"),
         ("h / ←", "Previous metric"),
         ("Enter / Click", "Enlarge metric"),
@@ -807,7 +1027,7 @@ fn draw_footer(f: &mut Frame, _app: &App, area: Rect) {
             Span::raw("    "),
             Span::styled("opengraphs", Style::default().fg(BORDER)),
         ])
-    } else {
+    } else if _app.active_tab == Tab::Graphs {
         Line::from(vec![
             Span::styled("Tab", Style::default().fg(GREEN)),
             Span::styled(" switch │ ", Style::default().fg(BORDER)),
@@ -817,6 +1037,21 @@ fn draw_footer(f: &mut Frame, _app: &App, area: Rect) {
             Span::styled(" quit │ ", Style::default().fg(BORDER)),
             Span::styled("h/l", Style::default().fg(GREEN)),
             Span::styled(" metrics │ ", Style::default().fg(BORDER)),
+            Span::styled("j/k", Style::default().fg(GREEN)),
+            Span::styled(" scroll │ ", Style::default().fg(BORDER)),
+            Span::styled("F6", Style::default().fg(GREEN)),
+            Span::styled(" copy", Style::default().fg(BORDER)),
+            Span::raw("    "),
+            Span::styled("opengraphs", Style::default().fg(BORDER)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("Tab", Style::default().fg(GREEN)),
+            Span::styled(" switch │ ", Style::default().fg(BORDER)),
+            Span::styled("?", Style::default().fg(GREEN)),
+            Span::styled(" help │ ", Style::default().fg(BORDER)),
+            Span::styled("q", Style::default().fg(GREEN)),
+            Span::styled(" quit │ ", Style::default().fg(BORDER)),
             Span::styled("j/k", Style::default().fg(GREEN)),
             Span::styled(" scroll │ ", Style::default().fg(BORDER)),
             Span::styled("F6", Style::default().fg(GREEN)),
