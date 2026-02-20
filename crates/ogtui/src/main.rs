@@ -1325,8 +1325,23 @@ fn spawn_daemon(
 ) -> Result<Child> {
     ensure_runtime_auth(runtime, true)?;
 
-    // Try python3 first, then python
-    let python = find_python();
+    // Prefer virtualenv Python for daemon dependencies, then fall back to system Python.
+    let python = find_python(codebase_root);
+    let agent_src = codebase_root.join("python").join("agent-chat");
+    let mut pythonpath_parts: Vec<String> = Vec::new();
+    if agent_src.is_dir() {
+        pythonpath_parts.push(agent_src.display().to_string());
+    }
+    if let Ok(existing) = std::env::var("PYTHONPATH") {
+        if !existing.trim().is_empty() {
+            pythonpath_parts.push(existing);
+        }
+    }
+    let merged_pythonpath = if pythonpath_parts.is_empty() {
+        None
+    } else {
+        Some(pythonpath_parts.join(":"))
+    };
 
     let mut cmd = Command::new(&python);
     cmd.arg("-m")
@@ -1340,7 +1355,11 @@ fn spawn_daemon(
         .arg("--runtime")
         .arg(runtime.as_str())
         .arg("--socket")
-        .arg(socket_path)
+        .arg(socket_path);
+    if let Some(ref py_path) = merged_pythonpath {
+        cmd.env("PYTHONPATH", py_path);
+    }
+    cmd.current_dir(codebase_root)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
@@ -1442,16 +1461,39 @@ fn ensure_prime_auth(allow_interactive_login: bool) -> Result<()> {
 }
 
 /// Find a working Python interpreter.
-fn find_python() -> String {
-    for candidate in ["python3", "python"] {
-        if Command::new(candidate)
+fn find_python(codebase_root: &Path) -> String {
+    let mut candidates: Vec<String> = Vec::new();
+
+    if let Ok(value) = std::env::var("OG_PYTHON_BIN") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            candidates.push(trimmed.to_string());
+        }
+    }
+
+    if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+        let venv_path = PathBuf::from(venv);
+        candidates.push(venv_path.join("bin/python3").display().to_string());
+        candidates.push(venv_path.join("bin/python").display().to_string());
+    }
+
+    let local_venv = codebase_root.join(".venv");
+    candidates.push(local_venv.join("bin/python3").display().to_string());
+    candidates.push(local_venv.join("bin/python").display().to_string());
+
+    candidates.push("python3".to_string());
+    candidates.push("python".to_string());
+
+    for candidate in candidates {
+        if Command::new(&candidate)
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .is_ok()
+            .map(|status| status.success())
+            .unwrap_or(false)
         {
-            return candidate.to_string();
+            return candidate;
         }
     }
     "python3".to_string()

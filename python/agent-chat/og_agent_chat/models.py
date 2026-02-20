@@ -32,6 +32,7 @@ class RunState:
     runtime_id: str | None = None
     runtime_failure_reason: str | None = None
     runtime_error_type: str | None = None
+    runtime_failure_class: str | None = None
     runtime_restarts: int = 0
     runtime_last_heartbeat: float | None = None
     runtime_last_exit_code: int | None = None

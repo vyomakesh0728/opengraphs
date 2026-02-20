@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -34,6 +35,8 @@ class DaemonConfig:
     max_runtime_retries: int = 2
     runtime_retry_backoff_secs: float = 2.0
     runtime_retry_backoff_max_secs: float = 20.0
+    runtime_heartbeat_timeout_secs: float = 30.0
+    runtime_heartbeat_check_secs: float = 2.0
     alert_rules: list[AlertRule] = field(default_factory=list)
 
 
@@ -120,6 +123,46 @@ async def serve(config: DaemonConfig) -> None:
     runtime_retry_count = 0
     runtime_failure_lock = asyncio.Lock()
 
+    def _runtime_status_health(status: str) -> float:
+        normalized = status.strip().lower()
+        if normalized == "running":
+            return 1.0
+        if normalized == "starting":
+            return 0.7
+        if normalized == "recovering":
+            return 0.5
+        return 0.0
+
+    def _runtime_status_code(status: str) -> float:
+        normalized = status.strip().lower()
+        codes = {
+            "idle": 0.0,
+            "starting": 1.0,
+            "running": 2.0,
+            "recovering": 3.0,
+            "failed": 4.0,
+            "stopped": 5.0,
+            "error": 6.0,
+        }
+        return codes.get(normalized, 99.0)
+
+    def _record_runtime_metrics() -> None:
+        run_state.add_metric(
+            "runtime/health",
+            _runtime_status_health(run_state.runtime_status),
+            step=run_state.current_step,
+        )
+        run_state.add_metric(
+            "runtime/state_code",
+            _runtime_status_code(run_state.runtime_status),
+            step=run_state.current_step,
+        )
+        run_state.add_metric(
+            "runtime/restarts",
+            float(run_state.runtime_restarts),
+            step=run_state.current_step,
+        )
+
     def _mark_runtime_heartbeat() -> None:
         run_state.runtime_last_heartbeat = time.time()
 
@@ -133,8 +176,10 @@ async def serve(config: DaemonConfig) -> None:
         runtime_id: str | None = None,
         reason: str | None = None,
         error_type: str | None = None,
+        failure_class: str | None = None,
         exit_code: int | None = None,
     ) -> None:
+        previous_status = run_state.runtime_status
         run_state.runtime_status = status
         if runtime_id is not None:
             run_state.runtime_id = runtime_id
@@ -142,9 +187,15 @@ async def serve(config: DaemonConfig) -> None:
             run_state.runtime_failure_reason = reason
         if error_type is not None:
             run_state.runtime_error_type = error_type
+        if failure_class is not None:
+            run_state.runtime_failure_class = failure_class
         if exit_code is not None:
             run_state.runtime_last_exit_code = exit_code
         _mark_runtime_heartbeat()
+        _record_runtime_metrics()
+        if previous_status != status:
+            details = f" ({reason})" if reason else ""
+            run_state.append_log(f"[system] runtime status -> {status}{details}")
 
     def _runtime_retry_backoff_secs(attempt: int) -> float:
         base = max(config.runtime_retry_backoff_secs, 0.1)
@@ -152,7 +203,9 @@ async def serve(config: DaemonConfig) -> None:
         return min(base * (2 ** max(attempt - 1, 0)), ceiling)
 
     def _runtime_failure_message(failure: RuntimeFailure) -> str:
+        failure_class = _classify_runtime_failure(failure)
         details: list[str] = []
+        details.append(f"class={failure_class}")
         if failure.status:
             details.append(f"status={failure.status}")
         if failure.error_type:
@@ -162,6 +215,84 @@ async def serve(config: DaemonConfig) -> None:
         if failure.message:
             details.append(failure.message)
         return " | ".join(details) if details else "runtime failure"
+
+    def _classify_runtime_failure(failure: RuntimeFailure) -> str:
+        text = " ".join(
+            [
+                failure.status or "",
+                failure.error_type or "",
+                failure.message or "",
+            ]
+        ).lower()
+        if any(
+            token in text
+            for token in (
+                "oom",
+                "out of memory",
+                "cuda out of memory",
+                "memoryerror",
+                "killed",
+            )
+        ):
+            return "oom"
+        if any(
+            token in text
+            for token in (
+                "timeout",
+                "timed out",
+                "deadline exceeded",
+                "heartbeat stale",
+            )
+        ):
+            return "timeout"
+        if any(
+            token in text
+            for token in (
+                "terminated",
+                "stopped",
+                "not running",
+                "not found",
+                "deleted",
+                "gone",
+            )
+        ):
+            return "terminated"
+        if any(
+            token in text
+            for token in (
+                "insufficient balance",
+                "insufficient quota",
+                "insufficient_funds",
+                "quota",
+            )
+        ):
+            return "quota"
+        if any(
+            token in text
+            for token in (
+                "unauthorized",
+                "forbidden",
+                "invalid api key",
+                "authentication",
+                "401",
+                "403",
+            )
+        ):
+            return "auth"
+        if any(
+            token in text
+            for token in (
+                "apierror",
+                "http",
+                "rate limit",
+                "429",
+                "gateway",
+                "dns",
+                "connection",
+            )
+        ):
+            return "api"
+        return "unknown"
 
     async def _stop_training_process() -> None:
         nonlocal runtime_adapter
@@ -225,6 +356,7 @@ async def serve(config: DaemonConfig) -> None:
         attempt = runtime_retry_count + 1
         runtime_retry_count = attempt
         run_state.runtime_restarts = attempt
+        _record_runtime_metrics()
         backoff = _runtime_retry_backoff_secs(attempt)
         _set_runtime_state(
             status="recovering",
@@ -242,15 +374,16 @@ async def serve(config: DaemonConfig) -> None:
 
     async def _handle_runtime_failure(failure: RuntimeFailure) -> None:
         async with runtime_failure_lock:
+            failure_class = _classify_runtime_failure(failure)
             message = _runtime_failure_message(failure)
             _set_runtime_state(
                 status="failed",
                 reason=message,
                 error_type=failure.error_type,
+                failure_class=failure_class,
                 exit_code=failure.exit_code,
             )
             _append_runtime_log(f"[error] runtime failure: {message}")
-
             alert = Alert(
                 metric="runtime/health",
                 threshold=0.0,
@@ -341,6 +474,33 @@ async def serve(config: DaemonConfig) -> None:
 
     _prepare_socket_path(config.socket_path)
     server = await asyncio.start_unix_server(handle_client, path=str(config.socket_path))
+    async def _runtime_watchdog_loop() -> None:
+        interval = max(config.runtime_heartbeat_check_secs, 0.5)
+        timeout = max(config.runtime_heartbeat_timeout_secs, interval)
+        while True:
+            await asyncio.sleep(interval)
+            if runtime_adapter is None:
+                continue
+            if run_state.runtime_status != "running":
+                continue
+            last = run_state.runtime_last_heartbeat
+            if last is None:
+                continue
+            age = time.time() - last
+            if age <= timeout:
+                continue
+            await _handle_runtime_failure(
+                RuntimeFailure(
+                    status="timeout",
+                    error_type="RUNTIME_HEARTBEAT_TIMEOUT",
+                    message=(
+                        f"runtime heartbeat stale for {age:.1f}s "
+                        f"(limit {timeout:.1f}s)"
+                    ),
+                )
+            )
+
+    runtime_watchdog_task = asyncio.create_task(_runtime_watchdog_loop())
     async with server:
         try:
             if config.start_training:
@@ -356,6 +516,9 @@ async def serve(config: DaemonConfig) -> None:
                     run_state.append_log(f"[error] failed to start training: {exc}")
             await server.serve_forever()
         finally:
+            runtime_watchdog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await runtime_watchdog_task
             await _stop_training_process()
 
 
@@ -407,6 +570,7 @@ async def _handle_payload(
                 "runtime_id": run_state.runtime_id,
                 "runtime_failure_reason": run_state.runtime_failure_reason,
                 "runtime_error_type": run_state.runtime_error_type,
+                "runtime_failure_class": run_state.runtime_failure_class,
                 "runtime_restarts": run_state.runtime_restarts,
                 "runtime_last_heartbeat": run_state.runtime_last_heartbeat,
                 "runtime_last_exit_code": run_state.runtime_last_exit_code,
@@ -580,6 +744,18 @@ def main() -> None:
         default=float(os.getenv("OG_RUNTIME_RETRY_BACKOFF_MAX_SECS", "20")),
         help="Maximum backoff seconds for runtime recovery retries",
     )
+    parser.add_argument(
+        "--runtime-heartbeat-timeout-secs",
+        type=float,
+        default=float(os.getenv("OG_RUNTIME_HEARTBEAT_TIMEOUT_SECS", "30")),
+        help="Runtime heartbeat stale timeout (seconds) before fail-fast recovery",
+    )
+    parser.add_argument(
+        "--runtime-heartbeat-check-secs",
+        type=float,
+        default=float(os.getenv("OG_RUNTIME_HEARTBEAT_CHECK_SECS", "2")),
+        help="Runtime heartbeat watchdog polling interval in seconds",
+    )
 
     args = parser.parse_args()
     if not args.training_file:
@@ -593,6 +769,8 @@ def main() -> None:
     max_runtime_retries = max(int(args.max_runtime_retries), 0)
     retry_backoff = max(float(args.runtime_retry_backoff_secs), 0.1)
     retry_backoff_max = max(float(args.runtime_retry_backoff_max_secs), retry_backoff)
+    heartbeat_check = max(float(args.runtime_heartbeat_check_secs), 0.5)
+    heartbeat_timeout = max(float(args.runtime_heartbeat_timeout_secs), heartbeat_check)
 
     config = DaemonConfig(
         training_file=Path(args.training_file),
@@ -607,6 +785,8 @@ def main() -> None:
         max_runtime_retries=max_runtime_retries,
         runtime_retry_backoff_secs=retry_backoff,
         runtime_retry_backoff_max_secs=retry_backoff_max,
+        runtime_heartbeat_timeout_secs=heartbeat_timeout,
+        runtime_heartbeat_check_secs=heartbeat_check,
         alert_rules=alert_rules,
     )
     asyncio.run(serve(config))
