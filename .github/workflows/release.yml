@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p ogtui -p ogd
+
+      - name: Package release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          target="${{ matrix.target }}"
+          pkg="opengraphs-${tag}-${target}"
+
+          mkdir -p "dist/${pkg}"
+          cp target/release/ogtui "dist/${pkg}/ogtui"
+          cp target/release/ogd "dist/${pkg}/ogd"
+
+          tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
+          if command -v shasum >/dev/null 2>&1; then
+            (
+              cd dist
+              shasum -a 256 "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
+            )
+          else
+            (
+              cd dist
+              sha256sum "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
+            )
+          fi
+          rm -rf "dist/${pkg}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

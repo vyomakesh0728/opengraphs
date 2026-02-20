@@ -34,6 +34,43 @@ Browser dashboards and port forwarding are painful on remote GPU boxes. `opengra
 - `crates/ogd`: daemon/backend + Trackio Rust client integration point
 - `python/agent-chat`: Python agent daemon (DSPy RLM + ReAct, alerts, code patching)
 
+## Install (users)
+
+One-line installer (always latest release):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scripts/install.sh | bash
+```
+
+Re-run the same command anytime to update to latest.
+
+Install a pinned version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scripts/install.sh | bash -s -- --version v0.1.2
+```
+
+Or run with `npx` (no manual install):
+
+```bash
+npx -y opengraphs-cli --help
+```
+
+Pinned `npx` version:
+
+```bash
+npx -y opengraphs-cli@0.1.2 --help
+```
+
+Global npm install:
+
+```bash
+npm install -g opengraphs-cli
+opengraphs-cli --help
+```
+
+Note: the `curl` installer and `npx` runner both resolve GitHub Releases (`vX.Y.Z` tags). If no release is published yet, use the developer quickstart below.
+
 ## Quickstart (developer)
 
 ```bash

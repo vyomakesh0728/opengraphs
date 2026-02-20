@@ -1,0 +1,24 @@
+{
+  "name": "opengraphs-cli",
+  "version": "0.1.2",
+  "description": "OpenGraphs npx runner for ogtui",
+  "bin": {
+    "opengraphs-cli": "bin/opengraphs.js",
+    "opengraphs": "bin/opengraphs.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vyomakesh0728/opengraphs.git"
+  },
+  "homepage": "https://github.com/vyomakesh0728/opengraphs#readme",
+  "bugs": {
+    "url": "https://github.com/vyomakesh0728/opengraphs/issues"
+  },
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  }
+}
