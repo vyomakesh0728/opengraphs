@@ -27,8 +27,8 @@ use app::{App, ProcessSnapshot, ProcessSort};
 #[derive(Debug, Clone, Args)]
 struct TuiArgs {
     /// Path to a directory containing .tfevents files, or a single .tfevents file
-    #[arg(short, long, default_value = "runs/")]
-    path: PathBuf,
+    #[arg(short, long)]
+    path: Option<PathBuf>,
 
     /// Training script to monitor (enables agent daemon)
     #[arg(short = 'f', long)]
@@ -377,7 +377,8 @@ fn main() -> Result<()> {
         return execute_cli_command(command, cli.json);
     }
 
-    run_tui(&cli.tui, None, None)
+    let clean_start = cli.tui.path.is_none();
+    run_tui(&cli.tui, None, None, clean_start)
 }
 
 fn execute_cli_command(command: OgCommand, json: bool) -> Result<()> {
@@ -385,7 +386,7 @@ fn execute_cli_command(command: OgCommand, json: bool) -> Result<()> {
         OgCommand::Run(args) => {
             let graph_filter = args.graph.as_deref().map(parse_graph_filter).transpose()?;
             let tui = run_args_to_tui(&args);
-            run_tui(&tui, args.prompt.clone(), graph_filter)
+            run_tui(&tui, args.prompt.clone(), graph_filter, false)
         }
         other => {
             let output = execute_query_command(other)?;
@@ -396,7 +397,7 @@ fn execute_cli_command(command: OgCommand, json: bool) -> Result<()> {
 
 fn run_args_to_tui(args: &RunArgs) -> TuiArgs {
     TuiArgs {
-        path: args.path.clone(),
+        path: Some(args.path.clone()),
         training_file: Some(args.file.clone()),
         training_cmd: args.training_cmd.clone(),
         start_training: true,
@@ -415,15 +416,37 @@ fn run_tui(
     tui: &TuiArgs,
     startup_prompt: Option<String>,
     graph_filter: Option<GraphFilter>,
+    clean_start: bool,
 ) -> Result<()> {
-    let mut initial = load_view_data(&tui.path)?;
+    let events_path = tui.path.clone().unwrap_or_else(|| PathBuf::from("runs/"));
+    let mut initial = if clean_start {
+        ViewData {
+            scalars: BTreeMap::new(),
+            log_lines: vec![
+                "-- clean view --".to_string(),
+                "[info] no run loaded yet".to_string(),
+                "[info] use `og run <file>` or pass --path to load existing runs".to_string(),
+            ],
+            total_events: 0,
+            max_step: 0,
+        }
+    } else {
+        load_view_data(&events_path)?
+    };
+
     if let Some(filter) = graph_filter.as_ref() {
         initial.scalars = filter_scalars(initial.scalars, filter);
     }
+
+    let app_path = if clean_start {
+        PathBuf::from("(clean)")
+    } else {
+        events_path.clone()
+    };
     let mut app = App::new(
         initial.scalars,
         initial.log_lines,
-        tui.path.clone(),
+        app_path,
         initial.total_events,
         initial.max_step,
     );
@@ -441,7 +464,7 @@ fn run_tui(
         match spawn_daemon(
             training_file,
             &tui.codebase_root,
-            &tui.path,
+            &events_path,
             tui.auto,
             start_training,
             tui.fresh_run,
@@ -472,7 +495,11 @@ fn run_tui(
     let result = run_app(
         &mut terminal,
         app,
-        &tui.path,
+        if clean_start {
+            None
+        } else {
+            Some(events_path.as_path())
+        },
         tui.refresh_ms,
         tui.procs_interval_ms,
         startup_prompt,
@@ -1689,7 +1716,7 @@ fn handle_in_app_og_command(
 fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     mut app: App,
-    events_path: &Path,
+    events_path: Option<&Path>,
     refresh_ms: u64,
     procs_interval_ms: u64,
     startup_prompt: Option<String>,
@@ -1750,60 +1777,63 @@ fn run_app<B: Backend>(
 
         if let Some(interval) = refresh_interval {
             if last_refresh.elapsed() >= interval {
-                if let Ok(mut updated) = load_view_data(events_path) {
-                    if let Some(filter) = graph_filter.as_ref() {
-                        updated.scalars = filter_scalars(updated.scalars, filter);
-                    }
-                    let prev_events = app.total_events;
-                    let prev_step = app.max_step;
-                    let events_grew = updated.total_events > prev_events;
-                    let step_changed = updated.max_step != prev_step;
-                    let daemon_live_metrics_active = app.daemon_connected && app.live_logs_active;
-                    if daemon_live_metrics_active {
-                        // Keep daemon-fed metrics visible even when event-file refresh is empty.
-                        app.total_events = app.total_events.max(updated.total_events);
-                        app.max_step = app.max_step.max(updated.max_step);
-                    } else {
-                        app.replace_data(
-                            updated.scalars,
-                            updated.log_lines,
-                            updated.total_events,
-                            updated.max_step,
-                        );
-                    }
-
-                    // Event-file refresh is also a live source (even when daemon is connected).
-                    if !app.live_logs_active && (events_grew || step_changed) {
-                        app.activate_live_logs();
-                        app.append_live_log(
-                            "[important] live mode: watching event stream updates".to_string(),
-                        );
-                        app.last_logged_step = prev_step;
-                    }
-
-                    if app.live_logs_active {
-                        if updated.total_events > prev_events {
-                            let delta = updated.total_events - prev_events;
-                            let suffix = if delta == 1 { "" } else { "s" };
-                            app.append_live_log(format!(
-                                "[info] {} new event{} parsed (total {})",
-                                delta, suffix, updated.total_events
-                            ));
+                if let Some(events_path) = events_path {
+                    if let Ok(mut updated) = load_view_data(events_path) {
+                        if let Some(filter) = graph_filter.as_ref() {
+                            updated.scalars = filter_scalars(updated.scalars, filter);
+                        }
+                        let prev_events = app.total_events;
+                        let prev_step = app.max_step;
+                        let events_grew = updated.total_events > prev_events;
+                        let step_changed = updated.max_step != prev_step;
+                        let daemon_live_metrics_active =
+                            app.daemon_connected && app.live_logs_active;
+                        if daemon_live_metrics_active {
+                            // Keep daemon-fed metrics visible even when event-file refresh is empty.
+                            app.total_events = app.total_events.max(updated.total_events);
+                            app.max_step = app.max_step.max(updated.max_step);
+                        } else {
+                            app.replace_data(
+                                updated.scalars,
+                                updated.log_lines,
+                                updated.total_events,
+                                updated.max_step,
+                            );
                         }
 
-                        if !app.daemon_connected && updated.max_step < app.last_logged_step {
-                            app.append_live_log(format!(
-                                "[info] step counter reset to {}",
-                                updated.max_step
-                            ));
-                            app.last_logged_step = updated.max_step;
-                        } else if updated.max_step > app.last_logged_step {
-                            let delta = updated.max_step - app.last_logged_step;
-                            app.append_live_log(format!(
-                                "[sucess] step {} completed (+{})",
-                                updated.max_step, delta
-                            ));
-                            app.last_logged_step = updated.max_step;
+                        // Event-file refresh is also a live source (even when daemon is connected).
+                        if !app.live_logs_active && (events_grew || step_changed) {
+                            app.activate_live_logs();
+                            app.append_live_log(
+                                "[important] live mode: watching event stream updates".to_string(),
+                            );
+                            app.last_logged_step = prev_step;
+                        }
+
+                        if app.live_logs_active {
+                            if updated.total_events > prev_events {
+                                let delta = updated.total_events - prev_events;
+                                let suffix = if delta == 1 { "" } else { "s" };
+                                app.append_live_log(format!(
+                                    "[info] {} new event{} parsed (total {})",
+                                    delta, suffix, updated.total_events
+                                ));
+                            }
+
+                            if !app.daemon_connected && updated.max_step < app.last_logged_step {
+                                app.append_live_log(format!(
+                                    "[info] step counter reset to {}",
+                                    updated.max_step
+                                ));
+                                app.last_logged_step = updated.max_step;
+                            } else if updated.max_step > app.last_logged_step {
+                                let delta = updated.max_step - app.last_logged_step;
+                                app.append_live_log(format!(
+                                    "[sucess] step {} completed (+{})",
+                                    updated.max_step, delta
+                                ));
+                                app.last_logged_step = updated.max_step;
+                            }
                         }
                     }
                 }

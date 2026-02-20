@@ -16,18 +16,18 @@ Update these files together:
 
 ```bash
 git add -A
-git commit -m "Release v0.1.2"
-git tag v0.1.2
+git commit -m "Release v0.1.3"
+git tag v0.1.3
 git push origin main
-git push origin v0.1.2
+git push origin v0.1.3
 ```
 
 ## 3. GitHub Actions publishes assets
 
 On tag push, CI builds and uploads:
 
-- `opengraphs-v0.1.2-x86_64-unknown-linux-gnu.tar.gz`
-- `opengraphs-v0.1.2-aarch64-apple-darwin.tar.gz`
+- `opengraphs-v0.1.3-x86_64-unknown-linux-gnu.tar.gz`
+- `opengraphs-v0.1.3-aarch64-apple-darwin.tar.gz`
 - matching `.sha256` files
 
 ## 4. User install/update
@@ -41,14 +41,14 @@ curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scrip
 Or pin a version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scripts/install.sh | bash -s -- --version v0.1.2
+curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scripts/install.sh | bash -s -- --version v0.1.3
 ```
 
 Or run from npm with npx:
 
 ```bash
 npx -y opengraphs-cli --help
-npx -y opengraphs-cli@0.1.2 --help
+npx -y opengraphs-cli@0.1.3 --help
 ```
 
 ## 5. Publish npm package
