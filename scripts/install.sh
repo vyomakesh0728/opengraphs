@@ -8,7 +8,7 @@ BIN_DIR=""
 
 usage() {
   cat <<'EOF'
-Install OpenGraphs binaries (ogtui + ogd) from GitHub releases.
+Install OpenGraphs binaries (ogtui + ogd + og alias) from GitHub releases.
 
 Usage:
   install.sh [--version <tag>] [--prefix <dir>] [--bin-dir <dir>] [--repo <owner/name>]
@@ -180,11 +180,13 @@ fi
 mkdir -p "${BIN_DIR}"
 install -m 0755 "${pkg_dir}/ogtui" "${BIN_DIR}/ogtui"
 install -m 0755 "${pkg_dir}/ogd" "${BIN_DIR}/ogd"
+install -m 0755 "${pkg_dir}/ogtui" "${BIN_DIR}/og"
 
 echo
 echo "Installed:"
 echo "  ${BIN_DIR}/ogtui"
 echo "  ${BIN_DIR}/ogd"
+echo "  ${BIN_DIR}/og"
 
 if [[ ":${PATH}:" != *":${BIN_DIR}:"* ]]; then
   echo
@@ -193,4 +195,4 @@ if [[ ":${PATH}:" != *":${BIN_DIR}:"* ]]; then
 fi
 
 echo
-echo "Done. Run: ogtui --help"
+echo "Done. Run: og --help"

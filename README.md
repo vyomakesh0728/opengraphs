@@ -58,6 +58,7 @@ Or run with `npx` (no manual install):
 
 ```bash
 npx -y opengraphs-cli --help
+npx -y opengraphs-cli run demo_train.py --auto autonomous
 ```
 
 Pinned `npx` version:
@@ -71,9 +72,44 @@ Global npm install:
 ```bash
 npm install -g opengraphs-cli
 opengraphs-cli --help
+og --help
+```
+
+Upgrade / uninstall:
+
+```bash
+# npm global upgrade
+npm install -g opengraphs-cli@latest
+
+# npm global uninstall
+npm uninstall -g opengraphs-cli
+```
+
+`npx` always runs from a package cache, so there is no uninstall step. To force latest:
+
+```bash
+npx -y opengraphs-cli@latest --help
 ```
 
 Note: the `curl` installer and `npx` runner both resolve GitHub Releases (`vX.Y.Z` tags). If no release is published yet, use the developer quickstart below.
+
+## CLI API (outside app)
+
+```bash
+og run demo_train.py --auto autonomous --graph '{"metrics":["loss","reward"],"sys":["gpu","vram"]}'
+og tail <run-id|log-path>
+og resume <run-id> --checkpoint latest
+og list projects
+og list runs --project <p>
+og list metrics --project <p> --run <r>
+og list system-metrics --project <p> --run <r>
+og get run --project <p> --run <r>
+og get metric --project <p> --run <r> --metric <m>
+og compare --runs r1,r2 --metric reward
+og search metrics --query loss
+```
+
+Every command supports `--json`.
 
 ## Quickstart (developer)
 
@@ -131,6 +167,14 @@ If you only want the current run (and not older eval/event files), pass that run
 
 ```bash
 cargo run -p ogtui -- --path runs/<current-run-id>
+```
+
+In chat tab, you can run CLI commands inline with `!og`:
+
+```text
+!og run demo_train.py --auto autonomous
+!og list runs --path runs/
+!og get metric --path runs/ --run <run-id> --metric train/loss
 ```
 
 ## Stars graph

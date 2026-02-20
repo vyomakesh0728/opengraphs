@@ -10,7 +10,7 @@ import stat
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from .agent import AgentEngine
 from .alerts import AlertDetector, AlertRule, default_alert_rules, load_alert_rules_from_env
@@ -208,6 +208,7 @@ async def serve(config: DaemonConfig) -> None:
                         run_state,
                         agent,
                         alert_detector,
+                        _restart_training_process,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -266,6 +267,7 @@ async def _handle_payload(
     run_state: RunState,
     agent: AgentEngine,
     alert_detector: AlertDetector,
+    restart_training_callback: Callable[[RunState], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     msg_type = payload.get("type")
 
@@ -342,6 +344,17 @@ async def _handle_payload(
         if not path:
             return {"ok": False, "error": "missing_path"}
         run_state.training_file = Path(path)
+        return {"ok": True}
+
+    if msg_type == "set_auto_mode":
+        enabled = bool(payload.get("enabled", False))
+        agent.executor.auto_mode = enabled
+        return {"ok": True, "auto_mode": enabled}
+
+    if msg_type == "start_training":
+        if restart_training_callback is None:
+            return {"ok": False, "error": "training_control_unavailable"}
+        await restart_training_callback(run_state)
         return {"ok": True}
 
     if msg_type == "apply_refactor":

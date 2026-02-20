@@ -194,6 +194,36 @@ pub fn apply_refactor(
     Ok((success, history))
 }
 
+/// Update daemon training file path.
+pub fn set_training_file(path: &Path, sock_path: &Path) -> Result<(), ClientError> {
+    let _resp = send_request(
+        &serde_json::json!({
+            "type": "set_training_file",
+            "path": path.to_string_lossy().to_string(),
+        }),
+        sock_path,
+    )?;
+    Ok(())
+}
+
+/// Toggle daemon auto mode.
+pub fn set_auto_mode(enabled: bool, sock_path: &Path) -> Result<bool, ClientError> {
+    let resp = send_request(
+        &serde_json::json!({"type": "set_auto_mode", "enabled": enabled}),
+        sock_path,
+    )?;
+    Ok(resp
+        .get("auto_mode")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(enabled))
+}
+
+/// Restart/start daemon training process with current run_state config.
+pub fn start_training(sock_path: &Path) -> Result<(), ClientError> {
+    let _resp = send_request(&serde_json::json!({"type": "start_training"}), sock_path)?;
+    Ok(())
+}
+
 /// Get run state from the daemon.
 pub fn get_run_state(sock_path: &Path) -> Result<RunStateResponse, ClientError> {
     let resp = send_request(

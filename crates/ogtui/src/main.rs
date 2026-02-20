@@ -3,14 +3,19 @@ mod socket_client;
 mod tfevents;
 mod ui;
 
-use anyhow::{Context, Result};
-use clap::Parser;
+use anyhow::{Context, Result, bail};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::prelude::*;
+use serde::Serialize;
+use serde_json::Value;
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -19,10 +24,8 @@ use std::time::{Duration, Instant};
 
 use app::{App, ProcessSnapshot, ProcessSort};
 
-/// opengraphs TUI — terminal-native experiment tracking viewer
-#[derive(Parser)]
-#[command(name = "ogtui", version, about)]
-struct Cli {
+#[derive(Debug, Clone, Args)]
+struct TuiArgs {
     /// Path to a directory containing .tfevents files, or a single .tfevents file
     #[arg(short, long, default_value = "runs/")]
     path: PathBuf,
@@ -72,8 +75,272 @@ struct Cli {
     procs_limit: usize,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AutoModeArg {
+    Observe,
+    Suggest,
+    Supervised,
+    Autonomous,
+}
+
+impl AutoModeArg {
+    fn daemon_auto_enabled(self) -> bool {
+        matches!(self, AutoModeArg::Autonomous)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GraphFilter {
+    metrics: Vec<String>,
+    sys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct RunArgs {
+    /// Training file to run
+    file: PathBuf,
+
+    /// Path to run directory where .tfevents files are written/read
+    #[arg(long, default_value = "runs/")]
+    path: PathBuf,
+
+    /// Graph selection JSON, e.g. '{"metrics":"loss","sys":"gpu"}'
+    #[arg(long)]
+    graph: Option<String>,
+
+    /// Optional prompt sent to the agent after startup
+    #[arg(long)]
+    prompt: Option<String>,
+
+    /// Auto mode policy
+    #[arg(long = "auto", value_enum, default_value = "suggest")]
+    auto_mode: AutoModeArg,
+
+    /// Command used to launch training process
+    #[arg(long)]
+    training_cmd: Option<String>,
+
+    /// Codebase root for agent indexing (default: current dir)
+    #[arg(long, default_value = ".")]
+    codebase_root: PathBuf,
+
+    /// Unix socket path for daemon communication
+    #[arg(long, env = "OGD_SOCKET")]
+    socket: Option<PathBuf>,
+
+    /// Refresh interval for live reload in milliseconds (0 disables live reload)
+    #[arg(long, default_value_t = 1000)]
+    refresh_ms: u64,
+
+    /// Sort key used in the procs tab
+    #[arg(long = "procs-sort", value_enum, default_value = "cpu")]
+    procs_sort: ProcessSort,
+
+    /// Process sampling interval in milliseconds (0 disables process polling)
+    #[arg(long = "procs-interval-ms", default_value_t = 1000)]
+    procs_interval_ms: u64,
+
+    /// Maximum number of running/exited processes retained in the procs tab
+    #[arg(long = "procs-limit", default_value_t = 300)]
+    procs_limit: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+struct TailArgs {
+    /// Run id or a direct log/tfevents path
+    target: String,
+
+    /// Number of lines/events to print from the tail
+    #[arg(long, default_value_t = 120)]
+    lines: usize,
+
+    /// Root runs directory for run-id resolution
+    #[arg(long, default_value = "runs/")]
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ResumeArgs {
+    /// Run id to resume
+    run_id: String,
+
+    /// Checkpoint id or 'latest'
+    #[arg(long, default_value = "latest")]
+    checkpoint: String,
+
+    /// Checkpoint directory root
+    #[arg(long, default_value = ".og_checkpoints")]
+    checkpoint_dir: PathBuf,
+
+    /// Root runs directory
+    #[arg(long, default_value = "runs/")]
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ListArgs {
+    #[command(subcommand)]
+    cmd: ListSubcommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ListSubcommand {
+    /// List available projects
+    Projects(ListProjectsArgs),
+    /// List runs for a project/root
+    Runs(ListRunsArgs),
+    /// List metrics in a run
+    Metrics(ListMetricsArgs),
+    /// List system metrics in a run
+    #[command(name = "system-metrics")]
+    SystemMetrics(ListMetricsArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct ListProjectsArgs {
+    #[arg(long, default_value = "runs/")]
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ListRunsArgs {
+    #[arg(long, default_value = "runs/")]
+    path: PathBuf,
+    #[arg(long)]
+    project: Option<String>,
+    #[arg(long = "tag")]
+    tag: Vec<String>,
+    #[arg(long = "config")]
+    config: Vec<String>,
+    #[arg(long)]
+    status: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ListMetricsArgs {
+    #[arg(long, default_value = "runs/")]
+    path: PathBuf,
+    #[arg(long)]
+    project: Option<String>,
+    #[arg(long)]
+    run: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct GetArgs {
+    #[command(subcommand)]
+    cmd: GetSubcommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum GetSubcommand {
+    /// Get run summary
+    Run(GetRunArgs),
+    /// Get metric series from a run
+    Metric(GetMetricArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct GetRunArgs {
+    #[arg(long, default_value = "runs/")]
+    path: PathBuf,
+    #[arg(long)]
+    project: Option<String>,
+    #[arg(long)]
+    run: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct GetMetricArgs {
+    #[arg(long, default_value = "runs/")]
+    path: PathBuf,
+    #[arg(long)]
+    project: Option<String>,
+    #[arg(long)]
+    run: String,
+    #[arg(long)]
+    metric: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CompareArgs {
+    /// Comma-separated run ids or paths
+    #[arg(long, value_delimiter = ',')]
+    runs: Vec<String>,
+    /// Metric to compare
+    #[arg(long)]
+    metric: String,
+    #[arg(long, default_value = "runs/")]
+    path: PathBuf,
+    #[arg(long)]
+    project: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct SearchArgs {
+    #[command(subcommand)]
+    cmd: SearchSubcommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum SearchSubcommand {
+    /// Search metric names
+    Metrics(SearchMetricsArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct SearchMetricsArgs {
+    #[arg(long)]
+    query: String,
+    #[arg(long, default_value = "runs/")]
+    path: PathBuf,
+    #[arg(long)]
+    project: Option<String>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum OgCommand {
+    /// Launch run in TUI
+    Run(RunArgs),
+    /// Tail logs/event stream
+    Tail(TailArgs),
+    /// Resolve resume checkpoint info
+    Resume(ResumeArgs),
+    /// List entities
+    List(ListArgs),
+    /// Get details
+    Get(GetArgs),
+    /// Compare metric across runs
+    Compare(CompareArgs),
+    /// Search entities
+    Search(SearchArgs),
+}
+
+/// OpenGraphs command surface.
+#[derive(Parser, Debug, Clone)]
+#[command(name = "og", version, about = "OpenGraphs CLI + TUI")]
+struct Cli {
+    /// Output JSON instead of plain text
+    #[arg(long, global = true)]
+    json: bool,
+
+    #[command(subcommand)]
+    command: Option<OgCommand>,
+
+    #[command(flatten)]
+    tui: TuiArgs,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CommandOutput {
+    command: String,
+    data: Value,
+    text: String,
+}
+
 struct ViewData {
-    scalars: std::collections::BTreeMap<String, Vec<(f64, f64)>>,
+    scalars: BTreeMap<String, Vec<(f64, f64)>>,
     log_lines: Vec<String>,
     total_events: usize,
     max_step: i64,
@@ -106,34 +373,79 @@ fn load_view_data(path: &Path) -> Result<ViewData> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(command) = cli.command.clone() {
+        return execute_cli_command(command, cli.json);
+    }
 
-    let initial = load_view_data(&cli.path)?;
+    run_tui(&cli.tui, None, None)
+}
+
+fn execute_cli_command(command: OgCommand, json: bool) -> Result<()> {
+    match command {
+        OgCommand::Run(args) => {
+            let graph_filter = args.graph.as_deref().map(parse_graph_filter).transpose()?;
+            let tui = run_args_to_tui(&args);
+            run_tui(&tui, args.prompt.clone(), graph_filter)
+        }
+        other => {
+            let output = execute_query_command(other)?;
+            print_command_output(&output, json)
+        }
+    }
+}
+
+fn run_args_to_tui(args: &RunArgs) -> TuiArgs {
+    TuiArgs {
+        path: args.path.clone(),
+        training_file: Some(args.file.clone()),
+        training_cmd: args.training_cmd.clone(),
+        start_training: true,
+        fresh_run: false,
+        codebase_root: args.codebase_root.clone(),
+        auto: args.auto_mode.daemon_auto_enabled(),
+        socket: args.socket.clone(),
+        refresh_ms: args.refresh_ms,
+        procs_sort: args.procs_sort,
+        procs_interval_ms: args.procs_interval_ms,
+        procs_limit: args.procs_limit,
+    }
+}
+
+fn run_tui(
+    tui: &TuiArgs,
+    startup_prompt: Option<String>,
+    graph_filter: Option<GraphFilter>,
+) -> Result<()> {
+    let mut initial = load_view_data(&tui.path)?;
+    if let Some(filter) = graph_filter.as_ref() {
+        initial.scalars = filter_scalars(initial.scalars, filter);
+    }
     let mut app = App::new(
         initial.scalars,
         initial.log_lines,
-        cli.path.clone(),
+        tui.path.clone(),
         initial.total_events,
         initial.max_step,
     );
-    app.set_process_preferences(cli.procs_sort, cli.procs_limit);
+    app.set_process_preferences(tui.procs_sort, tui.procs_limit);
 
     // Override socket path if provided
-    if let Some(ref sock) = cli.socket {
+    if let Some(ref sock) = tui.socket {
         app.daemon_socket = sock.clone();
     }
 
     // ── Spawn agent daemon if --training-file is provided ───────────────
     let mut daemon_child: Option<Child> = None;
-    if let Some(ref training_file) = cli.training_file {
-        let start_training = cli.start_training || cli.training_cmd.is_some();
+    if let Some(ref training_file) = tui.training_file {
+        let start_training = tui.start_training || tui.training_cmd.is_some();
         match spawn_daemon(
             training_file,
-            &cli.codebase_root,
-            &cli.path,
-            cli.auto,
+            &tui.codebase_root,
+            &tui.path,
+            tui.auto,
             start_training,
-            cli.fresh_run,
-            cli.training_cmd.as_deref(),
+            tui.fresh_run,
+            tui.training_cmd.as_deref(),
             &app.daemon_socket,
         ) {
             Ok(child) => {
@@ -160,9 +472,11 @@ fn main() -> Result<()> {
     let result = run_app(
         &mut terminal,
         app,
-        &cli.path,
-        cli.refresh_ms,
-        cli.procs_interval_ms,
+        &tui.path,
+        tui.refresh_ms,
+        tui.procs_interval_ms,
+        startup_prompt,
+        graph_filter,
     );
 
     // ── Restore terminal ────────────────────────────────────────────────
@@ -185,6 +499,756 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_command_output(output: &CommandOutput, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&output.data)?);
+    } else if !output.text.is_empty() {
+        println!("{}", output.text);
+    }
+    Ok(())
+}
+
+fn parse_graph_filter(raw: &str) -> Result<GraphFilter> {
+    fn parse_string_or_array(value: Option<&Value>, key: &str) -> Result<Vec<String>> {
+        let Some(value) = value else {
+            return Ok(Vec::new());
+        };
+        match value {
+            Value::String(s) => Ok(vec![s.clone()]),
+            Value::Array(items) => {
+                let mut out = Vec::new();
+                for item in items {
+                    let Some(s) = item.as_str() else {
+                        bail!("'{}' array must contain only strings", key);
+                    };
+                    out.push(s.to_string());
+                }
+                Ok(out)
+            }
+            _ => bail!("'{}' must be a string or an array of strings", key),
+        }
+    }
+
+    let parsed: Value =
+        serde_json::from_str(raw).with_context(|| "parsing --graph JSON".to_string())?;
+    let obj = parsed
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("--graph must be a JSON object"))?;
+    let metrics = parse_string_or_array(obj.get("metrics"), "metrics")?;
+    let sys = parse_string_or_array(obj.get("sys"), "sys")?;
+    Ok(GraphFilter { metrics, sys })
+}
+
+fn filter_scalars(
+    scalars: BTreeMap<String, Vec<(f64, f64)>>,
+    filter: &GraphFilter,
+) -> BTreeMap<String, Vec<(f64, f64)>> {
+    if filter.metrics.is_empty() && filter.sys.is_empty() {
+        return scalars;
+    }
+
+    let metrics: Vec<String> = filter
+        .metrics
+        .iter()
+        .map(|m| m.to_ascii_lowercase())
+        .collect();
+    let sys: Vec<String> = filter.sys.iter().map(|m| m.to_ascii_lowercase()).collect();
+    let mut filtered = BTreeMap::new();
+
+    for (tag, series) in scalars.iter() {
+        let tag_l = tag.to_ascii_lowercase();
+        let metric_match = metrics.iter().any(|m| tag_l.contains(m));
+        let sys_match = sys.iter().any(|m| tag_l.contains(m));
+        if metric_match || sys_match {
+            filtered.insert(tag.clone(), series.clone());
+        }
+    }
+
+    if filtered.is_empty() {
+        scalars
+    } else {
+        filtered
+    }
+}
+
+fn metric_matches_filter(metric: &str, filter: &GraphFilter) -> bool {
+    if filter.metrics.is_empty() && filter.sys.is_empty() {
+        return true;
+    }
+    let metric_l = metric.to_ascii_lowercase();
+    filter
+        .metrics
+        .iter()
+        .any(|needle| metric_l.contains(&needle.to_ascii_lowercase()))
+        || filter
+            .sys
+            .iter()
+            .any(|needle| metric_l.contains(&needle.to_ascii_lowercase()))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RunSummaryData {
+    id: String,
+    path: String,
+    metric_count: usize,
+    event_count: usize,
+    max_step: i64,
+    status: String,
+    last_updated_unix: Option<u64>,
+}
+
+fn execute_query_command(command: OgCommand) -> Result<CommandOutput> {
+    match command {
+        OgCommand::Run(_) => bail!("run must be executed in run mode"),
+        OgCommand::Tail(args) => execute_tail(args),
+        OgCommand::Resume(args) => execute_resume(args),
+        OgCommand::List(args) => execute_list(args),
+        OgCommand::Get(args) => execute_get(args),
+        OgCommand::Compare(args) => execute_compare(args),
+        OgCommand::Search(args) => execute_search(args),
+    }
+}
+
+fn execute_tail(args: TailArgs) -> Result<CommandOutput> {
+    let target_path = {
+        let explicit = PathBuf::from(&args.target);
+        if explicit.exists() {
+            explicit
+        } else {
+            args.path.join(&args.target)
+        }
+    };
+
+    if !target_path.exists() {
+        bail!("target '{}' not found", target_path.display());
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let kind: &str;
+    if target_path.is_dir() {
+        kind = "run_events";
+        let view = load_view_data(&target_path)?;
+        let start = view.log_lines.len().saturating_sub(args.lines);
+        lines.extend(view.log_lines[start..].iter().cloned());
+    } else if target_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|n| n.contains("tfevents"))
+        .unwrap_or(false)
+    {
+        kind = "tfevents";
+        let events = tfevents::parse_events_file(&target_path)?;
+        let start = events.len().saturating_sub(args.lines);
+        for ev in &events[start..] {
+            lines.push(format!(
+                "step {:>6} │ {:<30} │ {:.6}",
+                ev.step, ev.tag, ev.value
+            ));
+        }
+    } else {
+        kind = "text";
+        let raw = fs::read_to_string(&target_path)
+            .with_context(|| format!("reading {}", target_path.display()))?;
+        let all: Vec<&str> = raw.lines().collect();
+        let start = all.len().saturating_sub(args.lines);
+        lines.extend(all[start..].iter().map(|s| s.to_string()));
+    }
+
+    let data = serde_json::json!({
+        "target": target_path.display().to_string(),
+        "kind": kind,
+        "line_count": lines.len(),
+        "lines": lines,
+    });
+
+    let text = lines.join("\n");
+    Ok(CommandOutput {
+        command: "tail".to_string(),
+        data,
+        text,
+    })
+}
+
+fn execute_resume(args: ResumeArgs) -> Result<CommandOutput> {
+    let run_path = args.path.join(&args.run_id);
+    let checkpoint_path = resolve_checkpoint_path(&args.checkpoint_dir, &args.checkpoint)?;
+
+    let mut snapshot_files = Vec::new();
+    for entry in fs::read_dir(&checkpoint_path)? {
+        let entry = entry?;
+        if entry.path().is_file() && entry.file_name() != "state.json" {
+            snapshot_files.push(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    snapshot_files.sort();
+
+    let data = serde_json::json!({
+        "run_id": args.run_id,
+        "run_path": run_path.display().to_string(),
+        "run_exists": run_path.exists(),
+        "checkpoint": args.checkpoint,
+        "checkpoint_path": checkpoint_path.display().to_string(),
+        "snapshot_files": snapshot_files,
+        "note": "Checkpoint resolution is available. Resume apply/restore is handled by the agent refactor loop."
+    });
+
+    let text = format!(
+        "run: {}\ncheckpoint: {}\nfiles: {}\nnote: resume metadata resolved; apply/restore is agent-managed.",
+        run_path.display(),
+        checkpoint_path.display(),
+        snapshot_files.join(", ")
+    );
+    Ok(CommandOutput {
+        command: "resume".to_string(),
+        data,
+        text,
+    })
+}
+
+fn execute_list(args: ListArgs) -> Result<CommandOutput> {
+    match args.cmd {
+        ListSubcommand::Projects(a) => execute_list_projects(a),
+        ListSubcommand::Runs(a) => execute_list_runs(a),
+        ListSubcommand::Metrics(a) => execute_list_metrics(a, false),
+        ListSubcommand::SystemMetrics(a) => execute_list_metrics(a, true),
+    }
+}
+
+fn execute_get(args: GetArgs) -> Result<CommandOutput> {
+    match args.cmd {
+        GetSubcommand::Run(a) => execute_get_run(a),
+        GetSubcommand::Metric(a) => execute_get_metric(a),
+    }
+}
+
+fn execute_search(args: SearchArgs) -> Result<CommandOutput> {
+    match args.cmd {
+        SearchSubcommand::Metrics(a) => execute_search_metrics(a),
+    }
+}
+
+fn execute_list_projects(args: ListProjectsArgs) -> Result<CommandOutput> {
+    let base = args.path;
+    let mut projects = Vec::new();
+    for dir in list_immediate_dirs(&base)? {
+        let runs = list_run_dirs(&dir)?;
+        projects.push(serde_json::json!({
+            "name": dir.file_name().and_then(|n| n.to_str()).unwrap_or_default(),
+            "path": dir.display().to_string(),
+            "run_count": runs.len(),
+        }));
+    }
+    projects.sort_by(|a, b| {
+        let an = a.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+        let bn = b.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+        an.cmp(bn)
+    });
+
+    let mut text_lines = vec![format!("projects in {}", base.display())];
+    for p in &projects {
+        let name = p.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+        let runs = p.get("run_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        text_lines.push(format!("- {} ({})", name, runs));
+    }
+    if projects.is_empty() {
+        text_lines.push("- none".to_string());
+    }
+
+    let data = serde_json::json!({
+        "root": base.display().to_string(),
+        "projects": projects,
+    });
+    Ok(CommandOutput {
+        command: "list.projects".to_string(),
+        data,
+        text: text_lines.join("\n"),
+    })
+}
+
+fn execute_list_runs(args: ListRunsArgs) -> Result<CommandOutput> {
+    let base = project_base(&args.path, args.project.as_deref());
+    let mut runs = Vec::new();
+    for run_dir in list_run_dirs(&base)? {
+        let summary = summarize_run(&run_dir)?;
+        if let Some(status_filter) = args.status.as_deref() {
+            if !summary.status.eq_ignore_ascii_case(status_filter) {
+                continue;
+            }
+        }
+        let id_l = summary.id.to_ascii_lowercase();
+        if !args
+            .tag
+            .iter()
+            .all(|needle| id_l.contains(&needle.to_ascii_lowercase()))
+        {
+            continue;
+        }
+        if !args
+            .config
+            .iter()
+            .all(|needle| id_l.contains(&needle.to_ascii_lowercase()))
+        {
+            continue;
+        }
+        runs.push(summary);
+    }
+
+    runs.sort_by(|a, b| match b.last_updated_unix.cmp(&a.last_updated_unix) {
+        Ordering::Equal => a.id.cmp(&b.id),
+        other => other,
+    });
+
+    let mut text_lines = vec![format!("runs in {}", base.display())];
+    for run in &runs {
+        text_lines.push(format!(
+            "- {} | status={} | metrics={} | step={}",
+            run.id, run.status, run.metric_count, run.max_step
+        ));
+    }
+    if runs.is_empty() {
+        text_lines.push("- none".to_string());
+    }
+
+    let data = serde_json::json!({
+        "base": base.display().to_string(),
+        "count": runs.len(),
+        "runs": runs,
+    });
+    Ok(CommandOutput {
+        command: "list.runs".to_string(),
+        data,
+        text: text_lines.join("\n"),
+    })
+}
+
+fn execute_list_metrics(args: ListMetricsArgs, system_only: bool) -> Result<CommandOutput> {
+    let run_path = resolve_run_path(&args.path, args.project.as_deref(), &args.run);
+    let view = load_view_data(&run_path)?;
+    let mut names: Vec<String> = view.scalars.keys().cloned().collect();
+    names.sort();
+    if system_only {
+        names.retain(|n| looks_system_metric(n));
+    }
+
+    let header = if system_only {
+        "system metrics"
+    } else {
+        "metrics"
+    };
+    let mut text_lines = vec![format!("{} in {}", header, run_path.display())];
+    for name in &names {
+        text_lines.push(format!("- {}", name));
+    }
+    if names.is_empty() {
+        text_lines.push("- none".to_string());
+    }
+
+    let data = serde_json::json!({
+        "run": run_path.display().to_string(),
+        "system_only": system_only,
+        "count": names.len(),
+        "metrics": names,
+    });
+    Ok(CommandOutput {
+        command: if system_only {
+            "list.system-metrics".to_string()
+        } else {
+            "list.metrics".to_string()
+        },
+        data,
+        text: text_lines.join("\n"),
+    })
+}
+
+fn execute_get_run(args: GetRunArgs) -> Result<CommandOutput> {
+    let run_path = resolve_run_path(&args.path, args.project.as_deref(), &args.run);
+    let view = load_view_data(&run_path)?;
+    let mut latest = serde_json::Map::new();
+    for (metric, series) in &view.scalars {
+        if let Some((step, value)) = series.last() {
+            latest.insert(
+                metric.clone(),
+                serde_json::json!({"step": step, "value": value}),
+            );
+        }
+    }
+    let summary = summarize_run(&run_path)?;
+
+    let mut text_lines = vec![
+        format!("run {}", summary.id),
+        format!("path: {}", summary.path),
+        format!("status: {}", summary.status),
+        format!("metrics: {}", summary.metric_count),
+        format!("events: {}", summary.event_count),
+        format!("max_step: {}", summary.max_step),
+        "latest metrics:".to_string(),
+    ];
+    let mut keys: Vec<String> = latest.keys().cloned().collect();
+    keys.sort();
+    for k in keys {
+        if let Some(v) = latest.get(&k) {
+            text_lines.push(format!("- {}: {}", k, v));
+        }
+    }
+
+    let data = serde_json::json!({
+        "run": summary,
+        "latest_metrics": latest,
+    });
+    Ok(CommandOutput {
+        command: "get.run".to_string(),
+        data,
+        text: text_lines.join("\n"),
+    })
+}
+
+fn execute_get_metric(args: GetMetricArgs) -> Result<CommandOutput> {
+    let run_path = resolve_run_path(&args.path, args.project.as_deref(), &args.run);
+    let view = load_view_data(&run_path)?;
+    let Some(series) = view.scalars.get(&args.metric) else {
+        bail!(
+            "metric '{}' not found in run {}",
+            args.metric,
+            run_path.display()
+        );
+    };
+
+    let count = series.len();
+    let (min, max, last) = summarize_series(series);
+    let tail_n = 20usize.min(count);
+    let tail = &series[count.saturating_sub(tail_n)..];
+
+    let mut text_lines = vec![
+        format!("run: {}", run_path.display()),
+        format!("metric: {}", args.metric),
+        format!("count: {}", count),
+        format!("min: {:.6}", min),
+        format!("max: {:.6}", max),
+        format!("last: {:.6}", last),
+        "tail:".to_string(),
+    ];
+    for (step, value) in tail {
+        text_lines.push(format!("- step {} => {:.6}", step, value));
+    }
+
+    let points: Vec<Value> = series
+        .iter()
+        .map(|(step, value)| serde_json::json!({"step": step, "value": value}))
+        .collect();
+    let data = serde_json::json!({
+        "run": run_path.display().to_string(),
+        "metric": args.metric,
+        "count": count,
+        "min": min,
+        "max": max,
+        "last": last,
+        "points": points,
+    });
+    Ok(CommandOutput {
+        command: "get.metric".to_string(),
+        data,
+        text: text_lines.join("\n"),
+    })
+}
+
+fn execute_compare(args: CompareArgs) -> Result<CommandOutput> {
+    if args.runs.is_empty() {
+        bail!("--runs must include at least one run id/path");
+    }
+
+    let mut comparisons = Vec::new();
+    let mut text_lines = vec![format!("compare metric '{}'", args.metric)];
+    for run in &args.runs {
+        let run_path = resolve_run_path(&args.path, args.project.as_deref(), run);
+        let view = load_view_data(&run_path)?;
+        let Some(series) = view.scalars.get(&args.metric) else {
+            text_lines.push(format!(
+                "- {}: metric '{}' not found",
+                run_path.display(),
+                args.metric
+            ));
+            comparisons.push(serde_json::json!({
+                "run": run_path.display().to_string(),
+                "found": false,
+            }));
+            continue;
+        };
+        let (min, max, last) = summarize_series(series);
+        let first = series.first().map(|(_, v)| *v).unwrap_or(last);
+        let delta = last - first;
+        text_lines.push(format!(
+            "- {} | first={:.6} last={:.6} delta={:.6} min={:.6} max={:.6}",
+            run_path.display(),
+            first,
+            last,
+            delta,
+            min,
+            max
+        ));
+        comparisons.push(serde_json::json!({
+            "run": run_path.display().to_string(),
+            "found": true,
+            "count": series.len(),
+            "first": first,
+            "last": last,
+            "delta": delta,
+            "min": min,
+            "max": max,
+        }));
+    }
+
+    let data = serde_json::json!({
+        "metric": args.metric,
+        "comparisons": comparisons,
+    });
+    Ok(CommandOutput {
+        command: "compare".to_string(),
+        data,
+        text: text_lines.join("\n"),
+    })
+}
+
+fn execute_search_metrics(args: SearchMetricsArgs) -> Result<CommandOutput> {
+    let query = args.query.to_ascii_lowercase();
+    let base = project_base(&args.path, args.project.as_deref());
+    let mut matches = Vec::new();
+    for run_dir in list_run_dirs(&base)? {
+        let view = load_view_data(&run_dir)?;
+        let run_id = run_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        for name in view.scalars.keys() {
+            if name.to_ascii_lowercase().contains(&query) {
+                matches.push(serde_json::json!({
+                    "metric": name,
+                    "run": run_id,
+                    "path": run_dir.display().to_string(),
+                }));
+            }
+        }
+    }
+    matches.sort_by(|a, b| {
+        let am = a.get("metric").and_then(|v| v.as_str()).unwrap_or_default();
+        let bm = b.get("metric").and_then(|v| v.as_str()).unwrap_or_default();
+        am.cmp(bm)
+    });
+
+    let mut text_lines = vec![format!("search metrics query='{}'", args.query)];
+    for m in &matches {
+        let metric = m.get("metric").and_then(|v| v.as_str()).unwrap_or_default();
+        let run = m.get("run").and_then(|v| v.as_str()).unwrap_or_default();
+        text_lines.push(format!("- {} ({})", metric, run));
+    }
+    if matches.is_empty() {
+        text_lines.push("- none".to_string());
+    }
+
+    let data = serde_json::json!({
+        "query": args.query,
+        "count": matches.len(),
+        "matches": matches,
+    });
+    Ok(CommandOutput {
+        command: "search.metrics".to_string(),
+        data,
+        text: text_lines.join("\n"),
+    })
+}
+
+fn project_base(path: &Path, project: Option<&str>) -> PathBuf {
+    if let Some(project) = project {
+        path.join(project)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn resolve_run_path(path: &Path, project: Option<&str>, run: &str) -> PathBuf {
+    let direct = PathBuf::from(run);
+    if direct.exists() {
+        return direct;
+    }
+    project_base(path, project).join(run)
+}
+
+fn list_immediate_dirs(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    if !path.exists() {
+        return Ok(dirs);
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            dirs.push(entry_path);
+        }
+    }
+    dirs.sort();
+    Ok(dirs)
+}
+
+fn list_run_dirs(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut runs = Vec::new();
+    for dir in list_immediate_dirs(path)? {
+        if contains_tfevents(&dir)? {
+            runs.push(dir);
+        }
+    }
+
+    if runs.is_empty() && path.exists() && contains_tfevents(path)? {
+        runs.push(path.to_path_buf());
+    }
+    runs.sort();
+    Ok(runs)
+}
+
+fn contains_tfevents(path: &Path) -> Result<bool> {
+    if path.is_file() {
+        return Ok(path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|n| n.contains("tfevents"))
+            .unwrap_or(false));
+    }
+
+    if !path.exists() || !path.is_dir() {
+        return Ok(false);
+    }
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            if contains_tfevents(&entry_path)? {
+                return Ok(true);
+            }
+        } else if entry_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|n| n.contains("tfevents"))
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn summarize_run(path: &Path) -> Result<RunSummaryData> {
+    let view = load_view_data(path)?;
+    let id = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    let last_updated_unix = latest_mtime_unix(path)?;
+    let status = match last_updated_unix {
+        Some(last) if unix_now_secs().saturating_sub(last) <= 120 => "running",
+        Some(_) => "inactive",
+        None => "unknown",
+    }
+    .to_string();
+
+    Ok(RunSummaryData {
+        id,
+        path: path.display().to_string(),
+        metric_count: view.scalars.len(),
+        event_count: view.total_events,
+        max_step: view.max_step,
+        status,
+        last_updated_unix,
+    })
+}
+
+fn latest_mtime_unix(path: &Path) -> Result<Option<u64>> {
+    fn inner(path: &Path, best: &mut Option<u64>) -> Result<()> {
+        if path.is_file() {
+            let mtime = fs::metadata(path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            if let Some(mtime) = mtime {
+                *best = Some(best.map_or(mtime, |current| current.max(mtime)));
+            }
+            return Ok(());
+        }
+        if !path.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            inner(&entry.path(), best)?;
+        }
+        Ok(())
+    }
+
+    let mut best = None;
+    inner(path, &mut best)?;
+    Ok(best)
+}
+
+fn looks_system_metric(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("sys/")
+        || n.contains("gpu")
+        || n.contains("vram")
+        || n.contains("cpu")
+        || n.contains("memory")
+        || n.contains("/mem")
+        || n.contains("disk")
+        || n.contains("net")
+}
+
+fn summarize_series(series: &[(f64, f64)]) -> (f64, f64, f64) {
+    if series.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for (_, value) in series {
+        min = min.min(*value);
+        max = max.max(*value);
+    }
+    let last = series.last().map(|(_, v)| *v).unwrap_or(0.0);
+    (min, max, last)
+}
+
+fn resolve_checkpoint_path(checkpoint_dir: &Path, checkpoint: &str) -> Result<PathBuf> {
+    if checkpoint == "latest" {
+        let mut checkpoints = Vec::new();
+        if checkpoint_dir.exists() {
+            for entry in fs::read_dir(checkpoint_dir)? {
+                let entry = entry?;
+                if entry.path().is_dir() {
+                    checkpoints.push(entry.path());
+                }
+            }
+        }
+        checkpoints.sort();
+        let Some(latest) = checkpoints.last() else {
+            bail!("no checkpoints found under {}", checkpoint_dir.display());
+        };
+        return Ok(latest.clone());
+    }
+
+    let direct = checkpoint_dir.join(checkpoint);
+    if direct.is_dir() {
+        return Ok(direct);
+    }
+    let prefixed = checkpoint_dir.join(format!("ckpt_{}", checkpoint));
+    if prefixed.is_dir() {
+        return Ok(prefixed);
+    }
+    bail!(
+        "checkpoint '{}' not found under {}",
+        checkpoint,
+        checkpoint_dir.display()
+    )
 }
 
 /// Spawn the Python agent daemon as a child process.
@@ -491,12 +1555,145 @@ enum BgMessage {
     },
 }
 
+fn unix_now_secs_f64() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn push_chat_message(app: &mut App, sender: &str, content: String) {
+    app.chat_messages.push(socket_client::ChatMessage {
+        sender: sender.to_string(),
+        content,
+        timestamp: unix_now_secs_f64(),
+    });
+    app.chat_follow_tail = true;
+    let len = app.chat_messages.len();
+    app.chat_scroll = len.saturating_sub(1) as u16;
+}
+
+fn parse_bang_og_cli(content: &str) -> Result<Cli> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with("!og") {
+        bail!("not an !og command");
+    }
+
+    let without_bang = trimmed.trim_start_matches('!');
+    let words = shlex::split(without_bang)
+        .ok_or_else(|| anyhow::anyhow!("failed to parse command line"))?;
+    if words.is_empty() {
+        bail!("empty command");
+    }
+
+    let head = words[0].to_ascii_lowercase();
+    if head != "og" && head != "ogtui" {
+        bail!("expected !og prefix");
+    }
+
+    let mut argv = vec!["og".to_string()];
+    argv.extend(words.iter().skip(1).cloned());
+    Cli::try_parse_from(argv).map_err(|e| anyhow::anyhow!(e.to_string()))
+}
+
+fn execute_in_app_run_command(
+    args: RunArgs,
+    app: &mut App,
+    bg_tx: &mpsc::Sender<BgMessage>,
+) -> Result<CommandOutput> {
+    if !app.daemon_connected {
+        bail!("daemon is not connected; start og with --training-file first");
+    }
+
+    let graph_filter = args.graph.as_deref().map(parse_graph_filter).transpose()?;
+
+    socket_client::set_training_file(&args.file, &app.daemon_socket)?;
+    let auto_enabled = args.auto_mode.daemon_auto_enabled();
+    let resolved_auto = socket_client::set_auto_mode(auto_enabled, &app.daemon_socket)?;
+    update_auto_mode(app, resolved_auto);
+    socket_client::start_training(&app.daemon_socket)?;
+
+    if let Some(prompt) = args.prompt.clone() {
+        app.agent_thinking = true;
+        app.chat_status = "Sending prompt...".to_string();
+        let tx = bg_tx.clone();
+        let sock = app.daemon_socket.clone();
+        std::thread::spawn(
+            move || match socket_client::send_chat_message(&prompt, &sock) {
+                Ok((plan, messages)) => {
+                    let _ = tx.send(BgMessage::ChatSendResult { plan, messages });
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMessage::ChatSendError(e.to_string()));
+                }
+            },
+        );
+    }
+
+    let mode = match args.auto_mode {
+        AutoModeArg::Observe => "observe",
+        AutoModeArg::Suggest => "suggest",
+        AutoModeArg::Supervised => "supervised",
+        AutoModeArg::Autonomous => "autonomous",
+    };
+
+    let data = serde_json::json!({
+        "training_file": args.file.display().to_string(),
+        "mode": mode,
+        "auto_enabled": resolved_auto,
+        "prompt_sent": args.prompt.is_some(),
+        "graph": graph_filter,
+    });
+
+    let mut notes = vec![format!("started training: {}", args.file.display())];
+    notes.push(format!("mode: {}", mode));
+    if let Some(graph) = &args.graph {
+        notes.push(format!("graph filter: {}", graph));
+    }
+    if args.prompt.is_some() {
+        notes.push("startup prompt sent".to_string());
+    }
+
+    Ok(CommandOutput {
+        command: "run".to_string(),
+        data,
+        text: notes.join("\n"),
+    })
+}
+
+fn handle_in_app_og_command(
+    content: &str,
+    app: &mut App,
+    bg_tx: &mpsc::Sender<BgMessage>,
+) -> Result<()> {
+    let cli = parse_bang_og_cli(content)?;
+    let Some(command) = cli.command else {
+        bail!("usage: !og <run|tail|resume|list|get|compare|search> ...");
+    };
+
+    let output = match command {
+        OgCommand::Run(args) => execute_in_app_run_command(args, app, bg_tx)?,
+        other => execute_query_command(other)?,
+    };
+
+    let rendered = if cli.json {
+        serde_json::to_string_pretty(&output.data)?
+    } else {
+        output.text
+    };
+    push_chat_message(app, "system", rendered);
+    app.chat_status = "Command executed".to_string();
+    Ok(())
+}
+
 fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     mut app: App,
     events_path: &Path,
     refresh_ms: u64,
     procs_interval_ms: u64,
+    startup_prompt: Option<String>,
+    graph_filter: Option<GraphFilter>,
 ) -> Result<()> {
     // Track layout regions for mouse hit-testing
     let mut layout = ui::LayoutRegions::default();
@@ -513,6 +1710,7 @@ fn run_app<B: Backend>(
         (procs_interval_ms > 0).then(|| Duration::from_millis(procs_interval_ms));
     let mut last_process_poll = Instant::now();
     let tick_rate = Duration::from_millis(100);
+    let mut startup_prompt = startup_prompt;
 
     // Initial daemon connection check
     {
@@ -552,7 +1750,10 @@ fn run_app<B: Backend>(
 
         if let Some(interval) = refresh_interval {
             if last_refresh.elapsed() >= interval {
-                if let Ok(updated) = load_view_data(events_path) {
+                if let Ok(mut updated) = load_view_data(events_path) {
+                    if let Some(filter) = graph_filter.as_ref() {
+                        updated.scalars = filter_scalars(updated.scalars, filter);
+                    }
                     let prev_events = app.total_events;
                     let prev_step = app.max_step;
                     let events_grew = updated.total_events > prev_events;
@@ -635,6 +1836,21 @@ fn run_app<B: Backend>(
                     }
                     if !c {
                         app.last_daemon_log_tail.clear();
+                    } else if let Some(prompt) = startup_prompt.take() {
+                        app.agent_thinking = true;
+                        app.chat_status = "Sending startup prompt...".to_string();
+                        let tx = bg_tx.clone();
+                        let sock = app.daemon_socket.clone();
+                        std::thread::spawn(move || {
+                            match socket_client::send_chat_message(&prompt, &sock) {
+                                Ok((plan, messages)) => {
+                                    let _ = tx.send(BgMessage::ChatSendResult { plan, messages });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(BgMessage::ChatSendError(e.to_string()));
+                                }
+                            }
+                        });
                     }
                 }
                 BgMessage::ChatHistory(messages) => {
@@ -708,6 +1924,11 @@ fn run_app<B: Backend>(
 
                     // Merge daemon metrics into TUI scalars
                     for (metric, values) in &metrics {
+                        if let Some(filter) = graph_filter.as_ref() {
+                            if !metric_matches_filter(metric, filter) {
+                                continue;
+                            }
+                        }
                         if let Some(arr) = values.as_array() {
                             let total = arr.len() as i64;
                             for (idx, val) in arr.iter().enumerate() {
@@ -852,18 +2073,27 @@ fn run_app<B: Backend>(
                         }
                         KeyCode::Enter => {
                             let content = app.chat_input_take();
-                            if !content.is_empty() && app.daemon_connected {
-                                // Show user message immediately
-                                app.chat_messages.push(socket_client::ChatMessage {
-                                    sender: "user".to_string(),
-                                    content: content.clone(),
-                                    timestamp: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_secs_f64())
-                                        .unwrap_or(0.0),
-                                });
-                                let len = app.chat_messages.len();
-                                app.chat_scroll = len.saturating_sub(1) as u16;
+                            if content.trim().is_empty() {
+                                continue;
+                            }
+
+                            push_chat_message(&mut app, "user", content.clone());
+
+                            if content.trim_start().starts_with("!og") {
+                                if let Err(err) =
+                                    handle_in_app_og_command(&content, &mut app, &bg_tx)
+                                {
+                                    app.chat_status = format!("Command error: {}", err);
+                                    push_chat_message(
+                                        &mut app,
+                                        "system",
+                                        format!("command failed: {}", err),
+                                    );
+                                }
+                                continue;
+                            }
+
+                            if app.daemon_connected {
                                 app.agent_thinking = true;
                                 app.chat_status = "Sending...".to_string();
                                 let tx = bg_tx.clone();
@@ -879,6 +2109,9 @@ fn run_app<B: Backend>(
                                         let _ = tx.send(BgMessage::ChatSendError(e.to_string()));
                                     }
                                 });
+                            } else {
+                                app.chat_status =
+                                    "Daemon not connected (message not sent)".to_string();
                             }
                         }
                         KeyCode::Backspace => {
@@ -1025,7 +2258,15 @@ fn run_app<B: Backend>(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_live_log_line, parse_elapsed_secs, parse_process_line, tail_overlap};
+    use super::{
+        AutoModeArg, ListArgs, ListSubcommand, OgCommand, handle_in_app_og_command,
+        normalize_live_log_line, parse_bang_og_cli, parse_elapsed_secs, parse_graph_filter,
+        parse_process_line, tail_overlap,
+    };
+    use crate::app::App;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
 
     #[test]
     fn tail_overlap_handles_sliding_windows() {
@@ -1104,5 +2345,48 @@ mod tests {
     fn parse_elapsed_secs_handles_day_hour_format() {
         assert_eq!(parse_elapsed_secs("1-02:03:04"), Some(93_784));
         assert_eq!(parse_elapsed_secs("04:05"), Some(245));
+    }
+
+    #[test]
+    fn parse_bang_og_list_runs_command() {
+        let cli = parse_bang_og_cli("!og list runs --path runs/").expect("parse command");
+        match cli.command {
+            Some(OgCommand::List(ListArgs {
+                cmd: ListSubcommand::Runs(_),
+            })) => {}
+            _ => panic!("expected list runs command"),
+        }
+    }
+
+    #[test]
+    fn parse_bang_og_run_auto_mode() {
+        let cli =
+            parse_bang_og_cli("!og run demo_train.py --auto autonomous").expect("parse command");
+        match cli.command {
+            Some(OgCommand::Run(args)) => {
+                assert_eq!(args.file, PathBuf::from("demo_train.py"));
+                assert!(matches!(args.auto_mode, AutoModeArg::Autonomous));
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn parse_graph_filter_accepts_mixed_shapes() {
+        let raw = r#"{"metrics":"loss","sys":["gpu","vram"]}"#;
+        let parsed = parse_graph_filter(raw).expect("parse graph filter");
+        assert_eq!(parsed.metrics, vec!["loss"]);
+        assert_eq!(parsed.sys, vec!["gpu", "vram"]);
+    }
+
+    #[test]
+    fn in_app_og_list_command_appends_system_message() {
+        let mut app = App::new(BTreeMap::new(), Vec::new(), PathBuf::from("runs"), 0, 0);
+        let (tx, _rx) = mpsc::channel();
+        handle_in_app_og_command("!og list projects --path runs/", &mut app, &tx)
+            .expect("execute in-app command");
+        let last = app.chat_messages.last().expect("chat message");
+        assert_eq!(last.sender, "system");
+        assert!(last.content.contains("projects"));
     }
 }

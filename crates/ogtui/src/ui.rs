@@ -902,7 +902,7 @@ fn draw_chat_input(f: &mut Frame, app: &App, area: Rect) {
         BORDER
     };
     let title = if app.chat_input_focused {
-        " type message (Enter=send, Esc=unfocus) "
+        " type message or !og command (Enter=send, Esc=unfocus) "
     } else {
         " press 'i' to type "
     };
@@ -913,7 +913,7 @@ fn draw_chat_input(f: &mut Frame, app: &App, area: Rect) {
         .title(Span::styled(title, Style::default().fg(border_color)));
 
     let display_text = if app.chat_input.is_empty() && !app.chat_input_focused {
-        "Type a message to the agent...".to_string()
+        "Type a message or !og run demo_train.py ...".to_string()
     } else if app.chat_input_focused {
         format!("{}█", app.chat_input)
     } else {
@@ -956,6 +956,7 @@ fn draw_help_modal(f: &mut Frame, area: Rect) {
         ("Enter / Click", "Enlarge metric"),
         ("i", "Focus chat input"),
         ("Enter (chat)", "Send message"),
+        ("!og ...", "Run CLI commands in chat"),
         ("Esc (chat)", "Unfocus chat input"),
         ("y (chat)", "Apply pending refactor"),
         ("n (chat)", "Reject pending refactor"),

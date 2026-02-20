@@ -1,6 +1,7 @@
 # OpenGraphs release flow
 
 This repo publishes versioned binaries (`ogtui`, `ogd`) from git tags using `.github/workflows/release.yml`.
+Install surfaces expose `og` as an alias to `ogtui`.
 
 ## 1. Bump versions
 
