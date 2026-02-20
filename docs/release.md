@@ -59,6 +59,7 @@ brew upgrade vyomakesh0728/opengraphs/opengraphs
 ZeroBrew:
 
 ```bash
+# requires zb >= 0.1.2
 zb install vyomakesh0728/opengraphs/opengraphs
 # zb has no dedicated upgrade command yet; rerun install to refresh
 zb install vyomakesh0728/opengraphs/opengraphs
