@@ -38,6 +38,41 @@ Browser dashboards and port forwarding are painful on remote GPU boxes. `opengra
 - `crates/ogd`: daemon/backend + Trackio Rust client integration point
 - `python/agent-chat`: Python agent daemon (DSPy RLM + ReAct, alerts, code patching)
 
+## Install (users)
+
+One-line installer (always latest release):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scripts/install.sh | bash
+```
+
+Re-run the same command anytime to update to latest.
+
+Install a pinned version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scripts/install.sh | bash -s -- --version v0.1.0
+```
+
+Homebrew:
+
+```bash
+brew tap vyomakesh0728/opengraphs
+brew install vyomakesh0728/opengraphs/opengraphs
+brew upgrade vyomakesh0728/opengraphs/opengraphs
+```
+
+ZeroBrew (fast, experimental):
+
+```bash
+zb install vyomakesh0728/opengraphs/opengraphs
+# zb has no dedicated upgrade command yet; rerun install to refresh
+zb install vyomakesh0728/opengraphs/opengraphs
+```
+
+Note: `brew install opengraphs` (without tap prefix) works only after a Homebrew core merge.
+Note: the `curl` installer resolves published GitHub Releases (`vX.Y.Z` tags). If no release is published yet, use the developer quickstart below.
+
 ## Quickstart (developer)
 
 ```bash
