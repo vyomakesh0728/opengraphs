@@ -1,6 +1,6 @@
 {
   "name": "opengraphs-cli",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "OpenGraphs npx runner for ogtui",
   "bin": {
     "opengraphs-cli": "bin/opengraphs.js",

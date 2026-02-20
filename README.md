@@ -47,7 +47,7 @@ Re-run the same command anytime to update to latest.
 Install a pinned version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scripts/install.sh | bash -s -- --version v0.1.4
+curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scripts/install.sh | bash -s -- --version v0.1.5
 ```
 
 Or run with `npx` (no manual install):
@@ -60,7 +60,7 @@ npx -y opengraphs-cli run demo_train.py --auto autonomous
 Pinned `npx` version:
 
 ```bash
-npx -y opengraphs-cli@0.1.4
+npx -y opengraphs-cli@0.1.5
 ```
 
 Global npm install:
