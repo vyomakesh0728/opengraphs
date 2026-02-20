@@ -1,5 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+
+use clap::ValueEnum;
 
 use crate::socket_client::{ActionPlanResponse, ChatMessage};
 
@@ -8,27 +10,67 @@ use crate::socket_client::{ActionPlanResponse, ChatMessage};
 pub enum Tab {
     Graphs,
     Logs,
+    Processes,
     Chat,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ProcessSort {
+    Cpu,
+    Mem,
+    Pid,
+    Etime,
+}
+
+impl ProcessSort {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProcessSort::Cpu => "CPU usage",
+            ProcessSort::Mem => "memory usage",
+            ProcessSort::Pid => "PID",
+            ProcessSort::Etime => "elapsed time",
+        }
+    }
+}
+
 impl Tab {
-    pub const ALL: &[Tab] = &[Tab::Graphs, Tab::Logs, Tab::Chat];
+    pub const ALL: &[Tab] = &[Tab::Chat, Tab::Graphs, Tab::Processes, Tab::Logs];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Graphs => "graphs",
             Tab::Logs => "logs",
+            Tab::Processes => "procs",
             Tab::Chat => "chat",
         }
     }
 
     pub fn next(self) -> Tab {
         match self {
-            Tab::Graphs => Tab::Logs,
-            Tab::Logs => Tab::Chat,
             Tab::Chat => Tab::Graphs,
+            Tab::Graphs => Tab::Processes,
+            Tab::Processes => Tab::Logs,
+            Tab::Logs => Tab::Chat,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessSnapshot {
+    pub pid: i32,
+    pub ppid: i32,
+    pub state: String,
+    pub elapsed: String,
+    pub elapsed_secs: u64,
+    pub cpu_pct: f32,
+    pub mem_pct: f32,
+    pub command: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExitedProcess {
+    pub snapshot: ProcessSnapshot,
+    pub exited_at_unix: u64,
 }
 
 /// Application state.
@@ -100,6 +142,22 @@ pub struct App {
     pub last_logged_step: i64,
     /// Copy mode disables mouse capture so terminal text selection works
     pub copy_mode: bool,
+    /// Current running processes from host snapshot
+    pub running_processes: Vec<ProcessSnapshot>,
+    /// Recently exited processes that were seen in prior snapshots
+    pub exited_processes: Vec<ExitedProcess>,
+    /// Scroll offset in the processes tab
+    pub processes_scroll: u16,
+    /// Whether processes view should follow tail
+    pub processes_follow_tail: bool,
+    /// Number of visible rows in processes viewport
+    pub processes_viewport_rows: usize,
+    /// Total rendered rows in the processes tab
+    pub processes_total_rows: usize,
+    /// Sort mode in process view
+    pub process_sort: ProcessSort,
+    /// Maximum processes to show/store in lists
+    pub process_limit: usize,
 }
 
 impl App {
@@ -113,7 +171,7 @@ impl App {
         let tags: Vec<String> = scalars.keys().cloned().collect();
         let daemon_socket = crate::socket_client::socket_path();
         Self {
-            active_tab: Tab::Graphs,
+            active_tab: Tab::Chat,
             scalars,
             tags,
             log_lines,
@@ -146,7 +204,22 @@ impl App {
             seen_alert_count: 0,
             last_logged_step: max_step,
             copy_mode: false,
+            running_processes: Vec::new(),
+            exited_processes: Vec::new(),
+            processes_scroll: 0,
+            processes_follow_tail: false,
+            processes_viewport_rows: 1,
+            processes_total_rows: 1,
+            process_sort: ProcessSort::Cpu,
+            process_limit: 300,
         }
+    }
+
+    pub fn set_process_preferences(&mut self, sort: ProcessSort, limit: usize) {
+        self.process_sort = sort;
+        self.process_limit = limit.max(1);
+        self.running_processes.truncate(self.process_limit);
+        self.exited_processes.truncate(self.process_limit);
     }
 
     pub fn cycle_tab(&mut self) {
@@ -352,11 +425,123 @@ impl App {
         self.chat_scroll = self.chat_scroll.saturating_sub(1);
     }
 
+    pub fn update_processes(&mut self, running: Vec<ProcessSnapshot>, exited_at_unix: u64) {
+        let current_pids: HashSet<i32> = running.iter().map(|p| p.pid).collect();
+        for previous in &self.running_processes {
+            if !current_pids.contains(&previous.pid) {
+                self.exited_processes.insert(
+                    0,
+                    ExitedProcess {
+                        snapshot: previous.clone(),
+                        exited_at_unix,
+                    },
+                );
+            }
+        }
+
+        self.running_processes = running;
+        self.exited_processes.truncate(self.process_limit);
+
+        if self.processes_follow_tail {
+            self.processes_scroll = self.processes_max_scroll();
+        } else {
+            self.clamp_processes_scroll();
+        }
+    }
+
+    pub fn scroll_processes_down(&mut self) {
+        let max = self.processes_max_scroll();
+        self.processes_scroll = (self.processes_scroll + 1).min(max);
+        if self.processes_scroll >= max {
+            self.processes_follow_tail = true;
+        }
+    }
+
+    pub fn scroll_processes_up(&mut self) {
+        self.processes_follow_tail = false;
+        self.processes_scroll = self.processes_scroll.saturating_sub(1);
+    }
+
+    pub fn set_processes_viewport_rows(&mut self, rows: usize) {
+        self.processes_viewport_rows = rows.max(1);
+        if self.processes_follow_tail {
+            self.processes_scroll = self.processes_max_scroll();
+        } else {
+            self.clamp_processes_scroll();
+        }
+    }
+
+    pub fn set_processes_total_rows(&mut self, rows: usize) {
+        self.processes_total_rows = rows;
+        if self.processes_follow_tail {
+            self.processes_scroll = self.processes_max_scroll();
+        } else {
+            self.clamp_processes_scroll();
+        }
+    }
+
+    fn processes_max_scroll(&self) -> u16 {
+        self.processes_total_rows
+            .saturating_sub(self.processes_viewport_rows.max(1)) as u16
+    }
+
+    fn clamp_processes_scroll(&mut self) {
+        let max_scroll = self.processes_max_scroll();
+        if self.processes_scroll > max_scroll {
+            self.processes_scroll = max_scroll;
+        }
+    }
+
     pub fn update_chat_messages(&mut self, messages: Vec<ChatMessage>) {
         self.chat_messages = messages;
         if self.chat_follow_tail {
             // Clamp to bottom during render once wrapped line count is known.
             self.chat_scroll = u16::MAX;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{App, ProcessSnapshot};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn empty_app() -> App {
+        App::new(BTreeMap::new(), Vec::new(), PathBuf::from("runs"), 0, 0)
+    }
+
+    #[test]
+    fn update_processes_tracks_recently_exited() {
+        let mut app = empty_app();
+        let p1 = ProcessSnapshot {
+            pid: 100,
+            ppid: 1,
+            state: "R".to_string(),
+            elapsed: "00:01".to_string(),
+            elapsed_secs: 1,
+            cpu_pct: 10.0,
+            mem_pct: 2.0,
+            command: "python train.py".to_string(),
+        };
+        let p2 = ProcessSnapshot {
+            pid: 101,
+            ppid: 1,
+            state: "S".to_string(),
+            elapsed: "00:02".to_string(),
+            elapsed_secs: 2,
+            cpu_pct: 1.0,
+            mem_pct: 0.5,
+            command: "bash".to_string(),
+        };
+
+        app.update_processes(vec![p1.clone(), p2.clone()], 1_700_000_000);
+        assert_eq!(app.running_processes.len(), 2);
+        assert!(app.exited_processes.is_empty());
+
+        app.update_processes(vec![p2], 1_700_000_100);
+        assert_eq!(app.running_processes.len(), 1);
+        assert_eq!(app.exited_processes.len(), 1);
+        assert_eq!(app.exited_processes[0].snapshot.pid, p1.pid);
     }
 }
