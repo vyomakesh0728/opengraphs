@@ -51,28 +51,29 @@ Re-run the same command anytime to update to latest.
 Install a pinned version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scripts/install.sh | bash -s -- --version v0.1.0
+curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scripts/install.sh | bash -s -- --version v0.1.2
 ```
 
-Homebrew:
+Or run with `npx` (no manual install):
 
 ```bash
-brew tap vyomakesh0728/opengraphs
-brew install vyomakesh0728/opengraphs/opengraphs
-brew upgrade vyomakesh0728/opengraphs/opengraphs
+npx -y opengraphs-cli --help
 ```
 
-ZeroBrew (fast, experimental):
+Pinned `npx` version:
 
 ```bash
-# requires zb >= 0.1.2
-zb install vyomakesh0728/opengraphs/opengraphs
-# zb has no dedicated upgrade command yet; rerun install to refresh
-zb install vyomakesh0728/opengraphs/opengraphs
+npx -y opengraphs-cli@0.1.2 --help
 ```
 
-Note: `brew install opengraphs` (without tap prefix) works only after a Homebrew core merge.
-Note: the `curl` installer resolves published GitHub Releases (`vX.Y.Z` tags). If no release is published yet, use the developer quickstart below.
+Global npm install:
+
+```bash
+npm install -g opengraphs-cli
+opengraphs-cli --help
+```
+
+Note: the `curl` installer and `npx` runner both resolve GitHub Releases (`vX.Y.Z` tags). If no release is published yet, use the developer quickstart below.
 
 ## Quickstart (developer)
 

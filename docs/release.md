@@ -15,19 +15,18 @@ Update these files together:
 
 ```bash
 git add -A
-git commit -m "Release v0.1.1"
-git tag v0.1.1
+git commit -m "Release v0.1.2"
+git tag v0.1.2
 git push origin main
-git push origin v0.1.1
+git push origin v0.1.2
 ```
 
 ## 3. GitHub Actions publishes assets
 
 On tag push, CI builds and uploads:
 
-- `opengraphs-v0.1.1-x86_64-unknown-linux-gnu.tar.gz`
-- `opengraphs-v0.1.1-x86_64-apple-darwin.tar.gz`
-- `opengraphs-v0.1.1-aarch64-apple-darwin.tar.gz`
+- `opengraphs-v0.1.2-x86_64-unknown-linux-gnu.tar.gz`
+- `opengraphs-v0.1.2-aarch64-apple-darwin.tar.gz`
 - matching `.sha256` files
 
 ## 4. User install/update
@@ -41,28 +40,21 @@ curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scrip
 Or pin a version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scripts/install.sh | bash -s -- --version v0.1.1
+curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scripts/install.sh | bash -s -- --version v0.1.2
 ```
 
-## 5. Package-manager path
-
-Formula file: `Formula/opengraphs.rb`
-
-Homebrew:
+Or run from npm with npx:
 
 ```bash
-brew tap vyomakesh0728/opengraphs
-brew install vyomakesh0728/opengraphs/opengraphs
-brew upgrade vyomakesh0728/opengraphs/opengraphs
+npx -y opengraphs-cli --help
+npx -y opengraphs-cli@0.1.2 --help
 ```
 
-ZeroBrew:
+## 5. Publish npm package
+
+Package source is in `npm/opengraphs/`.
 
 ```bash
-# requires zb >= 0.1.2
-zb install vyomakesh0728/opengraphs/opengraphs
-# zb has no dedicated upgrade command yet; rerun install to refresh
-zb install vyomakesh0728/opengraphs/opengraphs
+cd npm/opengraphs
+npm publish
 ```
-
-Unqualified install (`brew install opengraphs`) requires a Homebrew core merge.
