@@ -128,6 +128,8 @@ og run demo_train.py --runtime modal
 
 `local` is the default. `prime` is production-ready for fail-fast sandbox monitoring + recovery.
 `modal` is currently a scaffold that runs via local execution while the remote adapter is finalized.
+When using `--runtime prime` from CLI and auth is missing, OpenGraphs will attempt
+`uvx prime login` (fallback: `uv run prime login`) before startup.
 
 ## Quickstart (developer)
 

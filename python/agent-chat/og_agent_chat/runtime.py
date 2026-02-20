@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import os
 import shlex
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -233,6 +234,53 @@ class PrimeRuntimeAdapter:
                 env[key] = value
         return env
 
+    def _prime_auth_config_path(self) -> Path:
+        home = Path(os.getenv("HOME") or "~").expanduser()
+        return home / ".prime" / "config.json"
+
+    def _has_prime_auth(self) -> bool:
+        api_key = os.getenv("PRIME_API_KEY", "").strip()
+        if api_key:
+            return True
+        return self._prime_auth_config_path().exists()
+
+    def _can_interactive_login(self) -> bool:
+        try:
+            return sys.stdin.isatty() and sys.stderr.isatty()
+        except Exception:
+            return False
+
+    def _ensure_prime_auth(self) -> None:
+        if self._has_prime_auth():
+            return
+
+        message = (
+            "Prime auth missing. Run `uvx prime login` (or `uv run prime login`) "
+            "or set PRIME_API_KEY."
+        )
+        if not self._can_interactive_login():
+            raise RuntimeError(message)
+
+        attempts = [
+            (["uvx", "prime", "login"], "uvx prime login"),
+            (["uv", "run", "prime", "login"], "uv run prime login"),
+        ]
+        for command, label in attempts:
+            try:
+                self.on_log(f"[system] prime auth missing; running `{label}`")
+                result = subprocess.run(command, check=False)
+            except FileNotFoundError:
+                self.on_log(f"[system] `{label}` unavailable")
+                continue
+            if result.returncode == 0 and self._has_prime_auth():
+                self.on_log(f"[system] prime auth configured via `{label}`")
+                return
+            self.on_log(
+                f"[error] `{label}` exited with code {result.returncode}; auth still missing"
+            )
+
+        raise RuntimeError(message)
+
     def _require_prime(self) -> None:
         if self._client is not None:
             return
@@ -366,6 +414,7 @@ class PrimeRuntimeAdapter:
         self._monitor_errors = 0
         self._stdout_tail = []
         self._stderr_tail = []
+        self._ensure_prime_auth()
         self._require_prime()
         assert self._client is not None
         assert self._create_sandbox_request is not None

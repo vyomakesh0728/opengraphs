@@ -16,7 +16,7 @@ use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -1323,6 +1323,8 @@ fn spawn_daemon(
     training_cmd: Option<&str>,
     socket_path: &PathBuf,
 ) -> Result<Child> {
+    ensure_runtime_auth(runtime, true)?;
+
     // Try python3 first, then python
     let python = find_python();
 
@@ -1364,6 +1366,79 @@ fn spawn_daemon(
     })?;
 
     Ok(child)
+}
+
+fn ensure_runtime_auth(runtime: RuntimeArg, allow_interactive_login: bool) -> Result<()> {
+    if matches!(runtime, RuntimeArg::Prime) {
+        ensure_prime_auth(allow_interactive_login)?;
+    }
+    Ok(())
+}
+
+fn prime_auth_config_path() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".prime").join("config.json"))
+}
+
+fn has_prime_auth() -> bool {
+    if let Ok(value) = std::env::var("PRIME_API_KEY") {
+        if !value.trim().is_empty() {
+            return true;
+        }
+    }
+    prime_auth_config_path()
+        .map(|path| path.exists())
+        .unwrap_or(false)
+}
+
+fn ensure_prime_auth(allow_interactive_login: bool) -> Result<()> {
+    if has_prime_auth() {
+        return Ok(());
+    }
+
+    let message = "Prime auth missing. Run `uvx prime login` (or `uv run prime login`) or set `PRIME_API_KEY`.";
+    if !allow_interactive_login {
+        bail!("{message}");
+    }
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        bail!("{message}");
+    }
+
+    eprintln!("Prime auth not found. Running login flow...");
+    let attempts: [(&str, &[&str], &str); 2] = [
+        ("uvx", &["prime", "login"], "uvx prime login"),
+        ("uv", &["run", "prime", "login"], "uv run prime login"),
+    ];
+    let mut attempted_any = false;
+    for (bin, args, label) in attempts {
+        match Command::new(bin).args(args).status() {
+            Ok(status) => {
+                attempted_any = true;
+                if status.success() && has_prime_auth() {
+                    eprintln!("Prime auth configured via `{label}`.");
+                    return Ok(());
+                }
+                eprintln!("`{label}` exited with status {status}.");
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                eprintln!("`{label}` unavailable (command not found).");
+            }
+            Err(err) => {
+                return Err(err.into());
+            }
+        }
+    }
+
+    if !attempted_any {
+        bail!(
+            "Prime auth missing and no uv command found. Install uv, then run `uvx prime login`, or set `PRIME_API_KEY`."
+        );
+    }
+    if has_prime_auth() {
+        return Ok(());
+    }
+    bail!("{message}")
 }
 
 /// Find a working Python interpreter.
@@ -1669,6 +1744,7 @@ fn execute_in_app_run_command(
     }
 
     let graph_filter = args.graph.as_deref().map(parse_graph_filter).transpose()?;
+    ensure_runtime_auth(args.runtime, false)?;
 
     let runtime = args.runtime.as_str();
     let resolved_runtime = socket_client::set_runtime(runtime, &app.daemon_socket)?;
