@@ -76,14 +76,29 @@ verify_checksum() {
   local archive_path checksum_path
   archive_path="$1"
   checksum_path="$2"
+  local expected actual
+
+  expected="$(awk 'NF { print $1; exit }' "${checksum_path}")"
+  if [[ -z "${expected}" ]]; then
+    echo "error: checksum file is empty or invalid: ${checksum_path}" >&2
+    exit 1
+  fi
 
   if command -v shasum >/dev/null 2>&1; then
-    (cd "$(dirname "${archive_path}")" && shasum -a 256 -c "$(basename "${checksum_path}")")
+    actual="$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
+    if [[ "${actual}" != "${expected}" ]]; then
+      echo "error: checksum mismatch for $(basename "${archive_path}")" >&2
+      exit 1
+    fi
     return 0
   fi
 
   if command -v sha256sum >/dev/null 2>&1; then
-    (cd "$(dirname "${archive_path}")" && sha256sum -c "$(basename "${checksum_path}")")
+    actual="$(sha256sum "${archive_path}" | awk '{print $1}')"
+    if [[ "${actual}" != "${expected}" ]]; then
+      echo "error: checksum mismatch for $(basename "${archive_path}")" >&2
+      exit 1
+    fi
     return 0
   fi
 

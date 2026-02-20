@@ -45,9 +45,15 @@ jobs:
 
           tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
           if command -v shasum >/dev/null 2>&1; then
-            shasum -a 256 "dist/${pkg}.tar.gz" > "dist/${pkg}.tar.gz.sha256"
+            (
+              cd dist
+              shasum -a 256 "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
+            )
           else
-            sha256sum "dist/${pkg}.tar.gz" > "dist/${pkg}.tar.gz.sha256"
+            (
+              cd dist
+              sha256sum "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
+            )
           fi
           rm -rf "dist/${pkg}"
 
