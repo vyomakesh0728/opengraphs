@@ -30,6 +30,11 @@ Operating policy:
    Do not wrap the diff in markdown fences.
 6. For demo_train.py stabilization, prefer changing all three knobs together:
    LEARNING_RATE -> 0.001, WARMUP_STEPS -> 20, PEAK_LR_MULT -> 1.0.
+7. For runtime failures (OOM, sandbox/container terminated, timeout):
+   - identify the direct failure cause from logs first.
+   - propose safe minimal fixes only (batch size, gradient accumulation, sequence length, workers).
+   - if evidence is insufficient, ACTION must be explain (do not guess large rewrites).
+8. Keep recovery-oriented changes bounded and reversible in one patch.
 
 Response format:
 DIAGNOSIS: <analysis of the problem>

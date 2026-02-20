@@ -5,9 +5,8 @@ import asyncio
 import json
 import logging
 import os
-import shlex
 import stat
-import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -15,6 +14,7 @@ from typing import Any, Awaitable, Callable
 from .agent import AgentEngine
 from .alerts import AlertDetector, AlertRule, default_alert_rules, load_alert_rules_from_env
 from .models import ActionPlan, Alert, ChatMessage, RunState
+from .runtime import RuntimeFailure, RuntimeType, build_runtime_adapter
 
 
 LOGGER = logging.getLogger(__name__)
@@ -30,6 +30,10 @@ class DaemonConfig:
     start_training: bool = False
     fresh_run: bool = False
     auto_mode: bool = False
+    runtime: RuntimeType = "local"
+    max_runtime_retries: int = 2
+    runtime_retry_backoff_secs: float = 2.0
+    runtime_retry_backoff_max_secs: float = 20.0
     alert_rules: list[AlertRule] = field(default_factory=list)
 
 
@@ -98,83 +102,183 @@ def _resolve_run_dir(path: Path | None) -> Path | None:
     return path
 
 
+def _normalize_runtime(value: str | None) -> RuntimeType:
+    raw = (value or "local").strip().lower()
+    if raw not in {"local", "prime", "modal"}:
+        raise ValueError(f"unsupported runtime '{value}' (expected local|prime|modal)")
+    return raw  # type: ignore[return-value]
+
+
 async def serve(config: DaemonConfig) -> None:
+    runtime_ref: dict[str, RuntimeType] = {"kind": config.runtime}
     run_state = RunState(
         training_file=config.training_file,
         codebase_root=config.codebase_root,
+        runtime=runtime_ref["kind"],
     )
-    training_process: asyncio.subprocess.Process | None = None
-    training_log_task: asyncio.Task[None] | None = None
+    runtime_adapter = None
+    runtime_retry_count = 0
+    runtime_failure_lock = asyncio.Lock()
 
-    async def _stream_training_logs(process: asyncio.subprocess.Process) -> None:
-        if process.stdout is None:
-            return
-        while True:
-            line = await process.stdout.readline()
-            if not line:
-                break
-            run_state.append_log(line.decode("utf-8", errors="replace").rstrip("\n"))
-        return_code = await process.wait()
-        run_state.append_log(f"[system] training exited with code {return_code}")
+    def _mark_runtime_heartbeat() -> None:
+        run_state.runtime_last_heartbeat = time.time()
+
+    def _append_runtime_log(line: str) -> None:
+        run_state.append_log(line)
+        _mark_runtime_heartbeat()
+
+    def _set_runtime_state(
+        *,
+        status: str,
+        runtime_id: str | None = None,
+        reason: str | None = None,
+        error_type: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        run_state.runtime_status = status
+        if runtime_id is not None:
+            run_state.runtime_id = runtime_id
+        if reason is not None:
+            run_state.runtime_failure_reason = reason
+        if error_type is not None:
+            run_state.runtime_error_type = error_type
+        if exit_code is not None:
+            run_state.runtime_last_exit_code = exit_code
+        _mark_runtime_heartbeat()
+
+    def _runtime_retry_backoff_secs(attempt: int) -> float:
+        base = max(config.runtime_retry_backoff_secs, 0.1)
+        ceiling = max(config.runtime_retry_backoff_max_secs, base)
+        return min(base * (2 ** max(attempt - 1, 0)), ceiling)
+
+    def _runtime_failure_message(failure: RuntimeFailure) -> str:
+        details: list[str] = []
+        if failure.status:
+            details.append(f"status={failure.status}")
+        if failure.error_type:
+            details.append(f"type={failure.error_type}")
+        if failure.exit_code is not None:
+            details.append(f"exit={failure.exit_code}")
+        if failure.message:
+            details.append(failure.message)
+        return " | ".join(details) if details else "runtime failure"
 
     async def _stop_training_process() -> None:
-        nonlocal training_process, training_log_task
+        nonlocal runtime_adapter
+        if runtime_adapter is None:
+            return
+        try:
+            await runtime_adapter.close()
+        finally:
+            runtime_adapter = None
+            if run_state.runtime_status not in {"failed", "error"}:
+                _set_runtime_state(status="stopped")
 
-        if training_process and training_process.returncode is None:
-            training_process.terminate()
-            try:
-                await asyncio.wait_for(training_process.wait(), timeout=5)
-            except TimeoutError:
-                training_process.kill()
-                await training_process.wait()
-
-        if training_log_task:
-            if not training_log_task.done():
-                training_log_task.cancel()
-                try:
-                    await training_log_task
-                except asyncio.CancelledError:
-                    pass
-            training_log_task = None
-
-        training_process = None
-
-    async def _restart_training_process(state: RunState) -> None:
-        nonlocal training_process, training_log_task
+    async def _restart_training_process(
+        state: RunState,
+        *,
+        reset_retry_budget: bool = True,
+    ) -> None:
+        nonlocal runtime_adapter, runtime_retry_count
 
         await _stop_training_process()
 
-        env = dict(os.environ)
-        env.setdefault("OGD_SOCKET", str(config.socket_path))
-        run_dir = _resolve_run_dir(config.run_dir)
-        if run_dir is not None:
-            run_dir.mkdir(parents=True, exist_ok=True)
-            env.setdefault("TB_LOG_DIR", str(run_dir))
-        env.setdefault("ENABLE_TB", "1")
-
-        if config.training_cmd:
-            command = shlex.split(config.training_cmd)
-            if not command:
-                raise RuntimeError("empty training command")
-        else:
-            command = [sys.executable, str(state.training_file)]
-
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=str(state.codebase_root),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=env,
+        runtime_adapter = build_runtime_adapter(
+            runtime=runtime_ref["kind"],
+            training_file=state.training_file,
+            codebase_root=state.codebase_root,
+            socket_path=config.socket_path,
+            run_dir=_resolve_run_dir(config.run_dir),
+            training_cmd=config.training_cmd,
+            on_log=_append_runtime_log,
+            on_failure=_handle_runtime_failure,
+            on_heartbeat=_mark_runtime_heartbeat,
         )
-        training_process = process
-        run_state.append_log(f"[system] training restarted (pid={process.pid})")
-        run_state.append_log(
-            "[system] launch command: "
-            + " ".join(shlex.quote(part) for part in command)
+
+        run_state.runtime_id = None
+        _set_runtime_state(status="starting")
+        start = await runtime_adapter.start()
+        if reset_retry_budget:
+            runtime_retry_count = 0
+            run_state.runtime_restarts = 0
+        _set_runtime_state(
+            status="running",
+            runtime_id=start.runtime_id,
+            exit_code=0,
         )
-        if run_dir is not None:
-            run_state.append_log(f"[system] TB_LOG_DIR={run_dir}")
-        training_log_task = asyncio.create_task(_stream_training_logs(process))
+        run_state.runtime = runtime_ref["kind"]
+        run_state.runtime_failure_reason = None
+        run_state.runtime_error_type = None
+
+    async def _maybe_recover_runtime_failure(failure: RuntimeFailure) -> None:
+        nonlocal runtime_retry_count
+        if not config.auto_mode:
+            _append_runtime_log(
+                "[system] auto mode disabled; runtime recovery requires manual restart"
+            )
+            return
+        if runtime_retry_count >= config.max_runtime_retries:
+            _append_runtime_log(
+                f"[error] runtime retry budget exhausted ({config.max_runtime_retries})"
+            )
+            return
+        attempt = runtime_retry_count + 1
+        runtime_retry_count = attempt
+        run_state.runtime_restarts = attempt
+        backoff = _runtime_retry_backoff_secs(attempt)
+        _set_runtime_state(
+            status="recovering",
+            reason=f"retrying after failure in {backoff:.1f}s (attempt {attempt})",
+        )
+        _append_runtime_log(
+            f"[system] runtime recovery scheduled in {backoff:.1f}s (attempt {attempt}/{config.max_runtime_retries})"
+        )
+        await asyncio.sleep(backoff)
+        try:
+            await _restart_training_process(run_state, reset_retry_budget=False)
+            _append_runtime_log("[system] runtime recovery restarted training")
+        except Exception as exc:
+            _append_runtime_log(f"[error] runtime recovery failed: {exc}")
+
+    async def _handle_runtime_failure(failure: RuntimeFailure) -> None:
+        async with runtime_failure_lock:
+            message = _runtime_failure_message(failure)
+            _set_runtime_state(
+                status="failed",
+                reason=message,
+                error_type=failure.error_type,
+                exit_code=failure.exit_code,
+            )
+            _append_runtime_log(f"[error] runtime failure: {message}")
+
+            alert = Alert(
+                metric="runtime/health",
+                threshold=0.0,
+                current=1.0,
+                message=message,
+                timestamp=time.time(),
+            )
+            run_state.add_alert(alert)
+            run_state.add_metric(
+                "runtime/failures",
+                float(run_state.runtime_restarts + 1),
+                step=run_state.current_step,
+            )
+
+            response = await agent.handle_alert(alert)
+            agent_handled_with_restart = (
+                config.auto_mode
+                and response is not None
+                and response.plan.action == "refactor"
+                and bool(response.plan.code_changes)
+            )
+            if agent_handled_with_restart:
+                _append_runtime_log(
+                    "[system] agent proposed refactor; relying on refactor restart path"
+                )
+                return
+
+            await _maybe_recover_runtime_failure(failure)
 
     agent = AgentEngine(
         run_state=run_state,
@@ -209,6 +313,7 @@ async def serve(config: DaemonConfig) -> None:
                         agent,
                         alert_detector,
                         _restart_training_process,
+                        runtime_ref,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -268,6 +373,7 @@ async def _handle_payload(
     agent: AgentEngine,
     alert_detector: AlertDetector,
     restart_training_callback: Callable[[RunState], Awaitable[None]] | None = None,
+    runtime_ref: dict[str, RuntimeType] | None = None,
 ) -> dict[str, Any]:
     msg_type = payload.get("type")
 
@@ -296,6 +402,14 @@ async def _handle_payload(
                 "alerts": alerts_payload,
                 "current_step": run_state.current_step,
                 "auto_mode": agent.executor.auto_mode,
+                "runtime": run_state.runtime,
+                "runtime_status": run_state.runtime_status,
+                "runtime_id": run_state.runtime_id,
+                "runtime_failure_reason": run_state.runtime_failure_reason,
+                "runtime_error_type": run_state.runtime_error_type,
+                "runtime_restarts": run_state.runtime_restarts,
+                "runtime_last_heartbeat": run_state.runtime_last_heartbeat,
+                "runtime_last_exit_code": run_state.runtime_last_exit_code,
             },
         }
 
@@ -351,10 +465,26 @@ async def _handle_payload(
         agent.executor.auto_mode = enabled
         return {"ok": True, "auto_mode": enabled}
 
+    if msg_type == "set_runtime":
+        if runtime_ref is None:
+            return {"ok": False, "error": "runtime_control_unavailable"}
+        runtime_raw = payload.get("runtime")
+        try:
+            runtime = _normalize_runtime(str(runtime_raw))
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        runtime_ref["kind"] = runtime
+        run_state.runtime = runtime
+        run_state.append_log(f"[system] runtime backend set to {runtime}")
+        return {"ok": True, "runtime": runtime}
+
     if msg_type == "start_training":
         if restart_training_callback is None:
             return {"ok": False, "error": "training_control_unavailable"}
-        await restart_training_callback(run_state)
+        try:
+            await restart_training_callback(run_state)
+        except Exception as exc:
+            return {"ok": False, "error": f"failed_to_start_training: {exc}"}
         return {"ok": True}
 
     if msg_type == "apply_refactor":
@@ -427,6 +557,29 @@ def main() -> None:
         default=os.getenv("OG_AGENT_AUTO", "0") == "1",
         help="Enable auto refactor mode",
     )
+    parser.add_argument(
+        "--runtime",
+        default=os.getenv("OG_RUNTIME", "local"),
+        help="Training runtime backend: local|prime|modal",
+    )
+    parser.add_argument(
+        "--max-runtime-retries",
+        type=int,
+        default=int(os.getenv("OG_MAX_RUNTIME_RETRIES", "2")),
+        help="Maximum auto-recovery retries for runtime failures",
+    )
+    parser.add_argument(
+        "--runtime-retry-backoff-secs",
+        type=float,
+        default=float(os.getenv("OG_RUNTIME_RETRY_BACKOFF_SECS", "2")),
+        help="Base backoff seconds for runtime recovery retries",
+    )
+    parser.add_argument(
+        "--runtime-retry-backoff-max-secs",
+        type=float,
+        default=float(os.getenv("OG_RUNTIME_RETRY_BACKOFF_MAX_SECS", "20")),
+        help="Maximum backoff seconds for runtime recovery retries",
+    )
 
     args = parser.parse_args()
     if not args.training_file:
@@ -435,6 +588,11 @@ def main() -> None:
     alert_rules = load_alert_rules_from_env()
     if not alert_rules:
         alert_rules = default_alert_rules(args.training_file)
+
+    runtime = _normalize_runtime(args.runtime)
+    max_runtime_retries = max(int(args.max_runtime_retries), 0)
+    retry_backoff = max(float(args.runtime_retry_backoff_secs), 0.1)
+    retry_backoff_max = max(float(args.runtime_retry_backoff_max_secs), retry_backoff)
 
     config = DaemonConfig(
         training_file=Path(args.training_file),
@@ -445,6 +603,10 @@ def main() -> None:
         start_training=args.start_training,
         fresh_run=args.fresh_run,
         auto_mode=args.auto,
+        runtime=runtime,
+        max_runtime_retries=max_runtime_retries,
+        runtime_retry_backoff_secs=retry_backoff,
+        runtime_retry_backoff_max_secs=retry_backoff_max,
         alert_rules=alert_rules,
     )
     asyncio.run(serve(config))

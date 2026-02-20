@@ -6,6 +6,7 @@ from typing import Literal
 
 ActionType = Literal["explain", "refactor"]
 SenderType = Literal["user", "agent", "system"]
+RuntimeType = Literal["local", "prime", "modal"]
 
 
 @dataclass
@@ -21,11 +22,19 @@ class Alert:
 class RunState:
     training_file: Path
     codebase_root: Path
+    runtime: RuntimeType = "local"
     metrics: dict[str, list[float]] = field(default_factory=dict)
     logs: list[str] = field(default_factory=list)
     alerts: list[Alert] = field(default_factory=list)
     current_step: int = 0
     is_active: bool = True
+    runtime_status: str = "idle"
+    runtime_id: str | None = None
+    runtime_failure_reason: str | None = None
+    runtime_error_type: str | None = None
+    runtime_restarts: int = 0
+    runtime_last_heartbeat: float | None = None
+    runtime_last_exit_code: int | None = None
 
     def latest_alert(self) -> Alert | None:
         if not self.alerts:

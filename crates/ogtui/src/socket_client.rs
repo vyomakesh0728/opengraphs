@@ -53,6 +53,14 @@ pub struct RunStateResponse {
     pub alerts: Vec<AlertInfo>,
     pub current_step: i64,
     pub auto_mode: bool,
+    pub runtime: Option<String>,
+    pub runtime_status: Option<String>,
+    pub runtime_id: Option<String>,
+    pub runtime_failure_reason: Option<String>,
+    pub runtime_error_type: Option<String>,
+    pub runtime_restarts: Option<i64>,
+    pub runtime_last_heartbeat: Option<f64>,
+    pub runtime_last_exit_code: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -216,6 +224,19 @@ pub fn set_auto_mode(enabled: bool, sock_path: &Path) -> Result<bool, ClientErro
         .get("auto_mode")
         .and_then(|v| v.as_bool())
         .unwrap_or(enabled))
+}
+
+/// Switch daemon runtime backend.
+pub fn set_runtime(runtime: &str, sock_path: &Path) -> Result<String, ClientError> {
+    let resp = send_request(
+        &serde_json::json!({"type": "set_runtime", "runtime": runtime}),
+        sock_path,
+    )?;
+    Ok(resp
+        .get("runtime")
+        .and_then(|v| v.as_str())
+        .unwrap_or(runtime)
+        .to_string())
 }
 
 /// Restart/start daemon training process with current run_state config.

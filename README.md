@@ -89,10 +89,21 @@ npx -y opengraphs-cli@latest
 
 Note: the `curl` installer and `npx` runner both resolve GitHub Releases (`vX.Y.Z` tags). If no release is published yet, use the developer quickstart below.
 
+## Download tracking
+
+Use this helper to split real binary pulls from checksum pulls:
+
+```bash
+./scripts/release-downloads.sh
+./scripts/release-downloads.sh --json
+```
+
+`Binary-only (.tar.gz)` is the cleanest GitHub release install signal.
+
 ## CLI API (outside app)
 
 ```bash
-og run demo_train.py --auto autonomous --graph '{"metrics":["loss","reward"],"sys":["gpu","vram"]}'
+og run demo_train.py --runtime local --auto autonomous --graph '{"metrics":["loss","reward"],"sys":["gpu","vram"]}'
 og tail <run-id|log-path>
 og resume <run-id> --checkpoint latest
 og list projects
@@ -106,6 +117,17 @@ og search metrics --query loss
 ```
 
 Every command supports `--json`.
+
+Runtime backends:
+
+```bash
+og run demo_train.py --runtime local
+og run demo_train.py --runtime prime
+og run demo_train.py --runtime modal
+```
+
+`local` is the default. `prime` is production-ready for fail-fast sandbox monitoring + recovery.
+`modal` is currently a scaffold that runs via local execution while the remote adapter is finalized.
 
 ## Quickstart (developer)
 
@@ -168,9 +190,19 @@ cargo run -p ogtui -- --path runs/<current-run-id>
 In chat tab, you can run CLI commands inline with `!og`:
 
 ```text
-!og run demo_train.py --auto autonomous
+!og run demo_train.py --runtime prime --auto autonomous
 !og list runs --path runs/
 !og get metric --path runs/ --run <run-id> --metric train/loss
+```
+
+Prime runtime environment (when using `--runtime prime`):
+
+```bash
+export PRIME_API_KEY="..."
+export OG_PRIME_DOCKER_IMAGE="python:3.11-slim"
+export OG_PRIME_CPU_CORES=2
+export OG_PRIME_MEMORY_GB=8
+export OG_MAX_RUNTIME_RETRIES=2
 ```
 
 ## Stars graph

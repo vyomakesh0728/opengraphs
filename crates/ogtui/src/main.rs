@@ -54,6 +54,10 @@ struct TuiArgs {
     #[arg(long)]
     auto: bool,
 
+    /// Runtime backend for training control
+    #[arg(long = "runtime", value_enum, default_value = "local")]
+    runtime: RuntimeArg,
+
     /// Unix socket path for daemon communication
     #[arg(long, env = "OGD_SOCKET")]
     socket: Option<PathBuf>,
@@ -90,6 +94,24 @@ impl AutoModeArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeArg {
+    Local,
+    Prime,
+    Modal,
+}
+
+impl RuntimeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            RuntimeArg::Local => "local",
+            RuntimeArg::Prime => "prime",
+            RuntimeArg::Modal => "modal",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct GraphFilter {
     metrics: Vec<String>,
@@ -116,6 +138,10 @@ struct RunArgs {
     /// Auto mode policy
     #[arg(long = "auto", value_enum, default_value = "suggest")]
     auto_mode: AutoModeArg,
+
+    /// Runtime backend for training control
+    #[arg(long = "runtime", value_enum, default_value = "local")]
+    runtime: RuntimeArg,
 
     /// Command used to launch training process
     #[arg(long)]
@@ -404,6 +430,7 @@ fn run_args_to_tui(args: &RunArgs) -> TuiArgs {
         fresh_run: false,
         codebase_root: args.codebase_root.clone(),
         auto: args.auto_mode.daemon_auto_enabled(),
+        runtime: args.runtime,
         socket: args.socket.clone(),
         refresh_ms: args.refresh_ms,
         procs_sort: args.procs_sort,
@@ -470,6 +497,7 @@ fn run_tui(
             &tui.codebase_root,
             &events_path,
             tui.auto,
+            tui.runtime,
             start_training,
             tui.fresh_run,
             tui.training_cmd.as_deref(),
@@ -1289,6 +1317,7 @@ fn spawn_daemon(
     codebase_root: &PathBuf,
     run_dir: &PathBuf,
     auto_mode: bool,
+    runtime: RuntimeArg,
     start_training: bool,
     fresh_run: bool,
     training_cmd: Option<&str>,
@@ -1306,6 +1335,8 @@ fn spawn_daemon(
         .arg(codebase_root)
         .arg("--run-dir")
         .arg(run_dir)
+        .arg("--runtime")
+        .arg(runtime.as_str())
         .arg("--socket")
         .arg(socket_path)
         .stdout(Stdio::null())
@@ -1639,6 +1670,8 @@ fn execute_in_app_run_command(
 
     let graph_filter = args.graph.as_deref().map(parse_graph_filter).transpose()?;
 
+    let runtime = args.runtime.as_str();
+    let resolved_runtime = socket_client::set_runtime(runtime, &app.daemon_socket)?;
     socket_client::set_training_file(&args.file, &app.daemon_socket)?;
     let auto_enabled = args.auto_mode.daemon_auto_enabled();
     let resolved_auto = socket_client::set_auto_mode(auto_enabled, &app.daemon_socket)?;
@@ -1668,10 +1701,10 @@ fn execute_in_app_run_command(
         AutoModeArg::Supervised => "supervised",
         AutoModeArg::Autonomous => "autonomous",
     };
-
     let data = serde_json::json!({
         "training_file": args.file.display().to_string(),
         "mode": mode,
+        "runtime": resolved_runtime,
         "auto_enabled": resolved_auto,
         "prompt_sent": args.prompt.is_some(),
         "graph": graph_filter,
@@ -1679,6 +1712,7 @@ fn execute_in_app_run_command(
 
     let mut notes = vec![format!("started training: {}", args.file.display())];
     notes.push(format!("mode: {}", mode));
+    notes.push(format!("runtime: {}", resolved_runtime));
     if let Some(graph) = &args.graph {
         notes.push(format!("graph filter: {}", graph));
     }
@@ -2297,7 +2331,7 @@ fn run_app<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoModeArg, ListArgs, ListSubcommand, OgCommand, handle_in_app_og_command,
+        AutoModeArg, ListArgs, ListSubcommand, OgCommand, RuntimeArg, handle_in_app_og_command,
         normalize_live_log_line, parse_bang_og_cli, parse_elapsed_secs, parse_graph_filter,
         parse_process_line, tail_overlap,
     };
@@ -2404,6 +2438,18 @@ mod tests {
             Some(OgCommand::Run(args)) => {
                 assert_eq!(args.file, PathBuf::from("demo_train.py"));
                 assert!(matches!(args.auto_mode, AutoModeArg::Autonomous));
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn parse_bang_og_run_runtime() {
+        let cli =
+            parse_bang_og_cli("!og run demo_train.py --runtime prime").expect("parse command");
+        match cli.command {
+            Some(OgCommand::Run(args)) => {
+                assert!(matches!(args.runtime, RuntimeArg::Prime));
             }
             _ => panic!("expected run command"),
         }
