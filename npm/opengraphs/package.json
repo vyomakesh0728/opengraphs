@@ -4,7 +4,8 @@
   "description": "OpenGraphs npx runner for ogtui",
   "bin": {
     "opengraphs-cli": "bin/opengraphs.js",
-    "opengraphs": "bin/opengraphs.js"
+    "opengraphs": "bin/opengraphs.js",
+    "og": "bin/opengraphs.js"
   },
   "files": [
     "bin"
