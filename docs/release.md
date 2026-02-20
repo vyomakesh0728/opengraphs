@@ -47,8 +47,8 @@ curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scrip
 Or run from npm with npx:
 
 ```bash
-npx -y opengraphs-cli --help
-npx -y opengraphs-cli@0.1.4 --help
+npx -y opengraphs-cli@latest
+npx -y opengraphs-cli@0.1.4
 ```
 
 ## 5. Publish npm package

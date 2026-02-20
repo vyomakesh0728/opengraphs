@@ -418,6 +418,7 @@ fn run_tui(
     graph_filter: Option<GraphFilter>,
     clean_start: bool,
 ) -> Result<()> {
+    let daemon_expected = tui.training_file.is_some() || tui.socket.is_some();
     let events_path = tui.path.clone().unwrap_or_else(|| PathBuf::from("runs/"));
     let mut initial = if clean_start {
         ViewData {
@@ -451,6 +452,9 @@ fn run_tui(
         initial.max_step,
     );
     app.set_process_preferences(tui.procs_sort, tui.procs_limit);
+    if !daemon_expected {
+        app.chat_status = "No daemon (optional)".to_string();
+    }
 
     // Override socket path if provided
     if let Some(ref sock) = tui.socket {
@@ -504,6 +508,7 @@ fn run_tui(
         tui.procs_interval_ms,
         startup_prompt,
         graph_filter,
+        daemon_expected,
     );
 
     // ── Restore terminal ────────────────────────────────────────────────
@@ -1721,6 +1726,7 @@ fn run_app<B: Backend>(
     procs_interval_ms: u64,
     startup_prompt: Option<String>,
     graph_filter: Option<GraphFilter>,
+    daemon_expected: bool,
 ) -> Result<()> {
     // Track layout regions for mouse hit-testing
     let mut layout = ui::LayoutRegions::default();
@@ -1853,10 +1859,12 @@ fn run_app<B: Backend>(
                     app.daemon_connected = c;
                     app.chat_status = if c {
                         "Connected".to_string()
-                    } else {
+                    } else if daemon_expected {
                         "Disconnected".to_string()
+                    } else {
+                        "No daemon (optional)".to_string()
                     };
-                    if was_connected != c && app.live_logs_active {
+                    if was_connected != c && app.live_logs_active && (daemon_expected || c) {
                         let line = if c {
                             "[info] daemon connected"
                         } else {

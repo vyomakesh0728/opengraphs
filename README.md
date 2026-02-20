@@ -53,14 +53,14 @@ curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scrip
 Or run with `npx` (no manual install):
 
 ```bash
-npx -y opengraphs-cli --help
+npx -y opengraphs-cli@latest
 npx -y opengraphs-cli run demo_train.py --auto autonomous
 ```
 
 Pinned `npx` version:
 
 ```bash
-npx -y opengraphs-cli@0.1.4 --help
+npx -y opengraphs-cli@0.1.4
 ```
 
 Global npm install:
@@ -84,7 +84,7 @@ npm uninstall -g opengraphs-cli
 `npx` always runs from a package cache, so there is no uninstall step. To force latest:
 
 ```bash
-npx -y opengraphs-cli@latest --help
+npx -y opengraphs-cli@latest
 ```
 
 Note: the `curl` installer and `npx` runner both resolve GitHub Releases (`vX.Y.Z` tags). If no release is published yet, use the developer quickstart below.

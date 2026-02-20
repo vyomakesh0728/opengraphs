@@ -3,7 +3,7 @@
 Run OpenGraphs TUI with `npx`:
 
 ```bash
-npx -y opengraphs-cli --help
+npx -y opengraphs-cli@latest
 npx -y opengraphs-cli run demo_train.py --auto autonomous
 ```
 
