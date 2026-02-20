@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import shlex
 import subprocess
@@ -193,6 +194,7 @@ class PrimeRuntimeAdapter:
         self._stdout_tail: list[str] = []
         self._stderr_tail: list[str] = []
         self._monitor_errors = 0
+        self._prime_team_id: str | None = None
 
     def _prime_workdir(self) -> str:
         return os.getenv("OG_PRIME_WORKDIR", "/workspace")
@@ -237,6 +239,25 @@ class PrimeRuntimeAdapter:
     def _prime_auth_config_path(self) -> Path:
         home = Path(os.getenv("HOME") or "~").expanduser()
         return home / ".prime" / "config.json"
+
+    def _resolve_prime_team_id(self) -> str | None:
+        env_team = os.getenv("PRIME_TEAM_ID", "").strip()
+        if env_team:
+            return env_team
+
+        config_path = self._prime_auth_config_path()
+        if not config_path.exists():
+            return None
+        try:
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+        value = raw.get("team_id")
+        if value is None:
+            return None
+        team_id = str(value).strip()
+        return team_id or None
 
     def _has_prime_auth(self) -> bool:
         api_key = os.getenv("PRIME_API_KEY", "").strip()
@@ -294,6 +315,15 @@ class PrimeRuntimeAdapter:
 
         self._client = AsyncSandboxClient()
         self._create_sandbox_request = CreateSandboxRequest
+        self._prime_team_id = self._resolve_prime_team_id()
+
+        if self._prime_team_id:
+            # Prime team accounts may require explicit team scoping at transport level.
+            transport = getattr(getattr(self._client, "client", None), "client", None)
+            headers = getattr(transport, "headers", None)
+            if headers is not None:
+                headers["X-Prime-Team-ID"] = self._prime_team_id
+            self.on_log(f"[system] prime team context: {self._prime_team_id}")
 
     async def _append_tail_lines(self, stream_name: str, text: str) -> None:
         lines = [line for line in text.splitlines() if line.strip()]
@@ -426,6 +456,7 @@ class PrimeRuntimeAdapter:
             memory_gb=self._prime_memory_gb(),
             timeout_minutes=self._prime_timeout_minutes(),
             labels=["opengraphs", "runtime:prime"],
+            team_id=self._prime_team_id,
         )
 
         sandbox = await self._client.create(request)

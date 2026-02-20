@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Optional
@@ -67,6 +68,9 @@ def ensure_dspy_configured(
 
     if api_base:
         lm_kwargs["api_base"] = api_base
+        prime_headers = _resolve_prime_inference_headers(api_base)
+        if prime_headers:
+            lm_kwargs["extra_headers"] = prime_headers
     if not model_type and model_name.startswith("openai/gpt-5"):
         model_type = "responses"
     if model_type:
@@ -94,3 +98,22 @@ def _resolve_provider_api_key(model_name: str, api_key: str | None) -> str | Non
             os.getenv("ANTHROPIC_API_KEY") or os.getenv("OG_AGENT_ANTHROPIC_API_KEY")
         )
     return None
+
+
+def _resolve_prime_inference_headers(api_base: str) -> dict[str, str] | None:
+    lower = api_base.lower()
+    if "pinference.ai" not in lower and "primeintellect.ai" not in lower:
+        return None
+
+    team_id = _sanitize_api_key(os.getenv("PRIME_TEAM_ID"))
+    if not team_id:
+        config_path = Path.home() / ".prime" / "config.json"
+        try:
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            raw = {}
+        team_id = _sanitize_api_key(str(raw.get("team_id") or ""))
+
+    if not team_id:
+        return None
+    return {"X-Prime-Team-ID": team_id}
