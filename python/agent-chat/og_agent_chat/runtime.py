@@ -5,8 +5,11 @@ import contextlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,6 +50,21 @@ def _tail_overlap(previous: list[str], current: list[str]) -> int:
     return 0
 
 
+def _looks_like_oom_text(text: str) -> bool:
+    normalized = (text or "").lower()
+    return any(
+        token in normalized
+        for token in (
+            "out of memory",
+            "cuda out of memory",
+            "cublas_status_alloc_failed",
+            "memoryerror",
+            "killed process",
+            "oom",
+        )
+    )
+
+
 class LocalRuntimeAdapter:
     runtime: RuntimeType = "local"
 
@@ -58,8 +76,10 @@ class LocalRuntimeAdapter:
         socket_path: Path,
         run_dir: Path | None,
         training_cmd: str | None,
+        runtime_env_overrides: dict[str, str] | None,
         on_log: Callable[[str], None],
         on_failure: Callable[[RuntimeFailure], Awaitable[None]],
+        on_complete: Callable[[str], Awaitable[None]],
         on_heartbeat: Callable[[], None],
     ) -> None:
         self.training_file = training_file
@@ -67,12 +87,15 @@ class LocalRuntimeAdapter:
         self.socket_path = socket_path
         self.run_dir = run_dir
         self.training_cmd = training_cmd
+        self.runtime_env_overrides = dict(runtime_env_overrides or {})
         self.on_log = on_log
         self.on_failure = on_failure
+        self.on_complete = on_complete
         self.on_heartbeat = on_heartbeat
         self._process: asyncio.subprocess.Process | None = None
         self._log_task: asyncio.Task[None] | None = None
         self._stop_requested = False
+        self._recent_lines: list[str] = []
 
     def _build_env(self) -> dict[str, str]:
         env = dict(os.environ)
@@ -81,6 +104,7 @@ class LocalRuntimeAdapter:
             self.run_dir.mkdir(parents=True, exist_ok=True)
             env.setdefault("TB_LOG_DIR", str(self.run_dir))
         env.setdefault("ENABLE_TB", "1")
+        env.update(self.runtime_env_overrides)
         return env
 
     def _resolve_command(self) -> list[str]:
@@ -98,7 +122,11 @@ class LocalRuntimeAdapter:
             line = await process.stdout.readline()
             if not line:
                 break
-            self.on_log(line.decode("utf-8", errors="replace").rstrip("\n"))
+            text = line.decode("utf-8", errors="replace").rstrip("\n")
+            self._recent_lines.append(text)
+            if len(self._recent_lines) > 400:
+                self._recent_lines = self._recent_lines[-400:]
+            self.on_log(text)
             self.on_heartbeat()
         return_code = await process.wait()
         self.on_log(f"[system] training exited with code {return_code}")
@@ -106,12 +134,19 @@ class LocalRuntimeAdapter:
             return
         if return_code == 0:
             self.on_log("[system] training completed successfully")
+            await self.on_complete("completed")
             return
+        recent = "\n".join(self._recent_lines[-200:])
+        is_oom = _looks_like_oom_text(recent)
         await self.on_failure(
             RuntimeFailure(
                 status="failed",
-                error_type="LOCAL_EXIT_NONZERO",
-                message="local training process exited unexpectedly",
+                error_type="LOCAL_OOM" if is_oom else "LOCAL_EXIT_NONZERO",
+                message=(
+                    "local training process OOM detected"
+                    if is_oom
+                    else "local training process exited unexpectedly"
+                ),
                 exit_code=return_code,
             )
         )
@@ -119,6 +154,7 @@ class LocalRuntimeAdapter:
     async def start(self) -> RuntimeStartResult:
         await self.stop()
         self._stop_requested = False
+        self._recent_lines = []
         command = self._resolve_command()
         process = await asyncio.create_subprocess_exec(
             *command,
@@ -173,16 +209,22 @@ class PrimeRuntimeAdapter:
         *,
         training_file: Path,
         codebase_root: Path,
+        run_dir: Path | None,
         training_cmd: str | None,
+        runtime_env_overrides: dict[str, str] | None,
         on_log: Callable[[str], None],
         on_failure: Callable[[RuntimeFailure], Awaitable[None]],
+        on_complete: Callable[[str], Awaitable[None]],
         on_heartbeat: Callable[[], None],
     ) -> None:
         self.training_file = training_file
         self.codebase_root = codebase_root
+        self.run_dir = run_dir
         self.training_cmd = training_cmd
+        self.runtime_env_overrides = dict(runtime_env_overrides or {})
         self.on_log = on_log
         self.on_failure = on_failure
+        self.on_complete = on_complete
         self.on_heartbeat = on_heartbeat
 
         self._client = None
@@ -195,6 +237,9 @@ class PrimeRuntimeAdapter:
         self._stderr_tail: list[str] = []
         self._monitor_errors = 0
         self._prime_team_id: str | None = None
+        self._resume_checkpoint_dir_remote: str | None = None
+        self._last_sync_at: float = 0.0
+        self._last_checkpoint_marker: str | None = None
 
     def _prime_workdir(self) -> str:
         return os.getenv("OG_PRIME_WORKDIR", "/workspace")
@@ -217,6 +262,38 @@ class PrimeRuntimeAdapter:
     def _max_wait_attempts(self) -> int:
         return int(os.getenv("OG_PRIME_WAIT_ATTEMPTS", "180"))
 
+    def _sync_interval_secs(self) -> float:
+        return max(float(os.getenv("OG_PRIME_SYNC_INTERVAL_SECS", "8")), 1.0)
+
+    def _sync_enabled(self) -> bool:
+        value = os.getenv("OG_PRIME_SYNC_ENABLE", "1").strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    def _checkpoint_dir_name(self) -> str:
+        raw = os.getenv("OG_PRIME_CHECKPOINT_DIR_NAME", "checkpoints").strip()
+        return raw or "checkpoints"
+
+    def _remote_checkpoint_dir(self, workdir: str) -> str:
+        custom = os.getenv("OG_PRIME_CHECKPOINT_DIR", "").strip()
+        if custom:
+            return custom
+        return f"{workdir.rstrip('/')}/{self._checkpoint_dir_name()}"
+
+    def _sync_root(self) -> Path | None:
+        if self.run_dir is None:
+            return None
+        root = self.run_dir / "prime_sync"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _local_checkpoint_dir(self) -> Path | None:
+        root = self._sync_root()
+        if root is None:
+            return None
+        path = root / "checkpoints"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     def _resolve_command(self, remote_training_path: str) -> str:
         if self.training_cmd and self.training_cmd.strip():
             command = self.training_cmd.strip()
@@ -234,6 +311,9 @@ class PrimeRuntimeAdapter:
             value = os.getenv(key)
             if value is not None:
                 env[key] = value
+        env.update(self.runtime_env_overrides)
+        if self._resume_checkpoint_dir_remote:
+            env.setdefault("OG_RESUME_CHECKPOINT_DIR", self._resume_checkpoint_dir_remote)
         return env
 
     def _prime_auth_config_path(self) -> Path:
@@ -325,6 +405,163 @@ class PrimeRuntimeAdapter:
                 headers["X-Prime-Team-ID"] = self._prime_team_id
             self.on_log(f"[system] prime team context: {self._prime_team_id}")
 
+    async def _sync_job_logs_to_local(self, sandbox_id: str) -> None:
+        if self._client is None or self._job is None:
+            return
+        root = self._sync_root()
+        if root is None:
+            return
+        logs_dir = root / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
+        targets = [
+            (self._job.stdout_log_file, logs_dir / "stdout.log"),
+            (self._job.stderr_log_file, logs_dir / "stderr.log"),
+        ]
+        for remote_path, local_path in targets:
+            try:
+                await self._client.download_file(
+                    sandbox_id,
+                    remote_path,
+                    str(local_path),
+                )
+            except Exception:
+                continue
+
+    async def _remote_checkpoint_marker(self, sandbox_id: str, remote_dir: str) -> str | None:
+        if self._client is None:
+            return None
+        quoted = shlex.quote(remote_dir)
+        command = (
+            "if [ -d {dir} ]; then "
+            "find {dir} -type f -printf '%T@ %p\\n' | sort -n | tail -1; "
+            "fi"
+        ).format(dir=quoted)
+        try:
+            result = await self._client.execute_command(sandbox_id, command, timeout=20)
+        except Exception:
+            return None
+        marker = (result.stdout or "").strip()
+        return marker or None
+
+    async def _sync_remote_checkpoints_to_local(self, sandbox_id: str, remote_dir: str) -> None:
+        if self._client is None:
+            return
+        local_dir = self._local_checkpoint_dir()
+        root = self._sync_root()
+        if local_dir is None or root is None:
+            return
+
+        marker = await self._remote_checkpoint_marker(sandbox_id, remote_dir)
+        if marker is None:
+            return
+        if marker == self._last_checkpoint_marker:
+            return
+
+        archive_remote = f"/tmp/og_ckpt_sync_{int(time.time())}.tgz"
+        quoted_dir = shlex.quote(remote_dir)
+        quoted_archive = shlex.quote(archive_remote)
+        create_cmd = (
+            "set -e; "
+            "[ -d {dir} ] && tar -czf {archive} -C {dir} ."
+        ).format(dir=quoted_dir, archive=quoted_archive)
+        await self._client.execute_command(sandbox_id, create_cmd, timeout=60)
+
+        local_archive = root / "checkpoints_latest.tgz"
+        await self._client.download_file(
+            sandbox_id,
+            archive_remote,
+            str(local_archive),
+        )
+        try:
+            if local_dir.exists():
+                shutil.rmtree(local_dir, ignore_errors=True)
+                local_dir.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(local_archive, "r:gz") as tar:
+                tar.extractall(local_dir)
+            self._last_checkpoint_marker = marker
+            self.on_log(
+                f"[system] prime checkpoint sync complete ({remote_dir} -> {local_dir})"
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                await self._client.execute_command(
+                    sandbox_id,
+                    f"rm -f {quoted_archive}",
+                    timeout=20,
+                )
+
+    async def _maybe_sync_artifacts(self, *, force: bool = False) -> None:
+        if not self._sync_enabled():
+            return
+        if self._client is None or self._sandbox_id is None:
+            return
+        now = time.time()
+        if not force and (now - self._last_sync_at) < self._sync_interval_secs():
+            return
+        sandbox_id = self._sandbox_id
+        await self._sync_job_logs_to_local(sandbox_id)
+        if self._resume_checkpoint_dir_remote:
+            with contextlib.suppress(Exception):
+                await self._sync_remote_checkpoints_to_local(
+                    sandbox_id,
+                    self._resume_checkpoint_dir_remote,
+                )
+        self._last_sync_at = now
+
+    async def _restore_checkpoints_to_remote_if_available(
+        self,
+        sandbox_id: str,
+        remote_checkpoint_dir: str,
+    ) -> bool:
+        if self._client is None or not self._sync_enabled():
+            return False
+        local_dir = self._local_checkpoint_dir()
+        if local_dir is None or not local_dir.exists():
+            return False
+        has_files = any(p.is_file() for p in local_dir.rglob("*"))
+        if not has_files:
+            return False
+
+        with tempfile.NamedTemporaryFile(prefix="og_resume_", suffix=".tgz", delete=False) as tmp:
+            archive_path = Path(tmp.name)
+        try:
+            with tarfile.open(archive_path, "w:gz") as tar:
+                tar.add(local_dir, arcname=".")
+            remote_archive = f"/tmp/{archive_path.name}"
+            await self._client.upload_file(
+                sandbox_id,
+                remote_archive,
+                str(archive_path),
+            )
+            cmd = (
+                "set -e; mkdir -p {dir}; tar -xzf {archive} -C {dir}; rm -f {archive}"
+            ).format(
+                dir=shlex.quote(remote_checkpoint_dir),
+                archive=shlex.quote(remote_archive),
+            )
+            await self._client.execute_command(sandbox_id, cmd, timeout=60)
+            self.on_log(
+                f"[system] restored checkpoints to prime sandbox: {remote_checkpoint_dir}"
+            )
+            return True
+        finally:
+            archive_path.unlink(missing_ok=True)
+
+    def _apply_resume_template_if_configured(
+        self,
+        command: str,
+        remote_checkpoint_dir: str,
+        restored: bool,
+    ) -> str:
+        template = os.getenv("OG_PRIME_RESUME_ARG_TEMPLATE", "").strip()
+        if not template or not restored:
+            return command
+        resume_arg = template.format(checkpoint_dir=remote_checkpoint_dir)
+        merged = f"{command} {resume_arg}".strip()
+        self.on_log(f"[system] prime resume arg applied: {resume_arg}")
+        return merged
+
     async def _append_tail_lines(self, stream_name: str, text: str) -> None:
         lines = [line for line in text.splitlines() if line.strip()]
         if stream_name == "stdout":
@@ -380,6 +617,21 @@ class PrimeRuntimeAdapter:
             )
         )
 
+    async def _delete_sandbox(self, sandbox_id: str, reason: str) -> None:
+        if self._client is None:
+            return
+        try:
+            await self._client.delete(sandbox_id)
+            self.on_log(f"[system] prime sandbox deleted: {sandbox_id} ({reason})")
+        except Exception as exc:
+            self.on_log(
+                f"[error] failed to delete prime sandbox {sandbox_id}: {exc}"
+            )
+        finally:
+            if self._sandbox_id == sandbox_id:
+                self._sandbox_id = None
+                self._job = None
+
     async def _monitor_loop(self) -> None:
         assert self._client is not None
         while not self._stop_requested:
@@ -391,6 +643,8 @@ class PrimeRuntimeAdapter:
                 self.on_heartbeat()
                 status = (sandbox.status or "").upper()
                 if status in {"ERROR", "TERMINATED", "TIMEOUT", "STOPPED"}:
+                    with contextlib.suppress(Exception):
+                        await self._maybe_sync_artifacts(force=True)
                     await self._notify_failure(
                         status=status.lower(),
                         error_type=sandbox.error_type,
@@ -401,21 +655,34 @@ class PrimeRuntimeAdapter:
                     return
 
                 await self._tail_job_logs()
+                await self._maybe_sync_artifacts(force=False)
                 job_status = await self._client.get_background_job(
                     self._sandbox_id, self._job
                 )
                 if job_status.completed:
                     await self._append_tail_lines("stdout", job_status.stdout or "")
                     await self._append_tail_lines("stderr", job_status.stderr or "")
+                    with contextlib.suppress(Exception):
+                        await self._maybe_sync_artifacts(force=True)
                     exit_code = int(job_status.exit_code or 0)
                     self.on_log(f"[system] prime job exited with code {exit_code}")
+                    current_sandbox = self._sandbox_id
+                    if current_sandbox:
+                        await self._delete_sandbox(current_sandbox, "job completed")
                     if exit_code == 0:
                         self.on_log("[system] prime job completed successfully")
+                        await self.on_complete("completed")
                         return
+                    combined = f"{job_status.stderr or ''}\n{job_status.stdout or ''}"
+                    is_oom = _looks_like_oom_text(combined)
                     await self._notify_failure(
                         status="failed",
-                        error_type="PRIME_JOB_EXIT_NONZERO",
-                        message="prime background job exited unexpectedly",
+                        error_type="PRIME_JOB_OOM" if is_oom else "PRIME_JOB_EXIT_NONZERO",
+                        message=(
+                            "prime background job OOM detected"
+                            if is_oom
+                            else "prime background job exited unexpectedly"
+                        ),
                         exit_code=exit_code,
                     )
                     return
@@ -444,6 +711,7 @@ class PrimeRuntimeAdapter:
         self._monitor_errors = 0
         self._stdout_tail = []
         self._stderr_tail = []
+        self._last_sync_at = 0.0
         self._ensure_prime_auth()
         self._require_prime()
         assert self._client is not None
@@ -469,10 +737,20 @@ class PrimeRuntimeAdapter:
         self.on_log(f"[system] prime sandbox ready: {sandbox.id}")
 
         workdir = self._prime_workdir()
+        self._resume_checkpoint_dir_remote = self._remote_checkpoint_dir(workdir)
         await self._client.execute_command(
             sandbox.id,
             f"mkdir -p {shlex.quote(workdir)}",
             timeout=20,
+        )
+        await self._client.execute_command(
+            sandbox.id,
+            f"mkdir -p {shlex.quote(self._resume_checkpoint_dir_remote)}",
+            timeout=20,
+        )
+        restored = await self._restore_checkpoints_to_remote_if_available(
+            sandbox.id,
+            self._resume_checkpoint_dir_remote,
         )
 
         remote_training_path = f"{workdir.rstrip('/')}/{self.training_file.name}"
@@ -484,6 +762,11 @@ class PrimeRuntimeAdapter:
         )
 
         command = self._resolve_command(remote_training_path)
+        command = self._apply_resume_template_if_configured(
+            command,
+            self._resume_checkpoint_dir_remote,
+            restored=restored,
+        )
         self.on_log(f"[system] prime launch command: {command}")
         self._job = await self._client.start_background_job(
             sandbox.id,
@@ -511,18 +794,14 @@ class PrimeRuntimeAdapter:
                     await self._monitor_task
         self._monitor_task = None
 
-        if self._client is not None and self._sandbox_id is not None:
-            sandbox_id = self._sandbox_id
-            try:
-                await self._client.delete(sandbox_id)
-                self.on_log(f"[system] prime sandbox deleted: {sandbox_id}")
-            except Exception as exc:
-                self.on_log(
-                    f"[error] failed to delete prime sandbox {sandbox_id}: {exc}"
-                )
+        if self._sandbox_id is not None:
+            with contextlib.suppress(Exception):
+                await self._maybe_sync_artifacts(force=True)
+            await self._delete_sandbox(self._sandbox_id, "runtime stop")
 
         self._sandbox_id = None
         self._job = None
+        self._resume_checkpoint_dir_remote = None
         self._stdout_tail = []
         self._stderr_tail = []
 
@@ -555,17 +834,22 @@ def build_runtime_adapter(
     socket_path: Path,
     run_dir: Path | None,
     training_cmd: str | None,
+    runtime_env_overrides: dict[str, str] | None,
     on_log: Callable[[str], None],
     on_failure: Callable[[RuntimeFailure], Awaitable[None]],
+    on_complete: Callable[[str], Awaitable[None]],
     on_heartbeat: Callable[[], None],
 ) -> RuntimeAdapter:
     if runtime == "prime":
         return PrimeRuntimeAdapter(
             training_file=training_file,
             codebase_root=codebase_root,
+            run_dir=run_dir,
             training_cmd=training_cmd,
+            runtime_env_overrides=runtime_env_overrides,
             on_log=on_log,
             on_failure=on_failure,
+            on_complete=on_complete,
             on_heartbeat=on_heartbeat,
         )
     if runtime == "modal":
@@ -575,8 +859,10 @@ def build_runtime_adapter(
             socket_path=socket_path,
             run_dir=run_dir,
             training_cmd=training_cmd,
+            runtime_env_overrides=runtime_env_overrides,
             on_log=on_log,
             on_failure=on_failure,
+            on_complete=on_complete,
             on_heartbeat=on_heartbeat,
         )
     return LocalRuntimeAdapter(
@@ -585,7 +871,9 @@ def build_runtime_adapter(
         socket_path=socket_path,
         run_dir=run_dir,
         training_cmd=training_cmd,
+        runtime_env_overrides=runtime_env_overrides,
         on_log=on_log,
         on_failure=on_failure,
+        on_complete=on_complete,
         on_heartbeat=on_heartbeat,
     )

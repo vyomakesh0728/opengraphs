@@ -36,6 +36,13 @@ class RunState:
     runtime_restarts: int = 0
     runtime_last_heartbeat: float | None = None
     runtime_last_exit_code: int | None = None
+    rollout_id: str = "primary"
+    rollout_desired_state: str = "idle"
+    rollout_observed_state: str = "idle"
+    rollout_generation: int = 0
+    rollout_lease_deadline: float | None = None
+    rollout_last_transition_ts: float | None = None
+    rollout_last_error: str | None = None
 
     def latest_alert(self) -> Alert | None:
         if not self.alerts:

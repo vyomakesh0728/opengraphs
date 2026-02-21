@@ -37,6 +37,33 @@ class DaemonConfig:
     runtime_retry_backoff_max_secs: float = 20.0
     runtime_heartbeat_timeout_secs: float = 30.0
     runtime_heartbeat_check_secs: float = 2.0
+    oom_policy_enabled: bool = True
+    oom_min_batch_size: int = 1
+    oom_default_batch_size: int = 32
+    oom_max_grad_accum: int = 64
+    oom_min_seq_len: int = 128
+    oom_batch_env_keys: list[str] = field(
+        default_factory=lambda: [
+            "DEMO_BATCH",
+            "BATCH_SIZE",
+            "MICRO_BATCH_SIZE",
+            "PER_DEVICE_TRAIN_BATCH_SIZE",
+        ]
+    )
+    oom_accum_env_keys: list[str] = field(
+        default_factory=lambda: [
+            "GRAD_ACCUM_STEPS",
+            "GRADIENT_ACCUMULATION_STEPS",
+        ]
+    )
+    oom_seq_env_keys: list[str] = field(
+        default_factory=lambda: [
+            "SEQ_LEN",
+            "MAX_SEQ_LEN",
+            "BLOCK_SIZE",
+            "CONTEXT_LENGTH",
+        ]
+    )
     alert_rules: list[AlertRule] = field(default_factory=list)
 
 
@@ -122,6 +149,29 @@ async def serve(config: DaemonConfig) -> None:
     runtime_adapter = None
     runtime_retry_count = 0
     runtime_failure_lock = asyncio.Lock()
+    runtime_env_overrides: dict[str, str] = {}
+    run_state.rollout_desired_state = "idle"
+    run_state.rollout_observed_state = "idle"
+    run_state.rollout_last_transition_ts = time.time()
+
+    def _set_rollout_state(
+        *,
+        observed: str,
+        desired: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        now = time.time()
+        run_state.rollout_observed_state = observed
+        if desired is not None:
+            run_state.rollout_desired_state = desired
+        run_state.rollout_last_transition_ts = now
+        timeout = max(config.runtime_heartbeat_timeout_secs, 1.0)
+        if observed in {"starting", "running", "recovering"}:
+            run_state.rollout_lease_deadline = now + timeout
+        else:
+            run_state.rollout_lease_deadline = None
+        if reason:
+            run_state.rollout_last_error = reason
 
     def _runtime_status_health(status: str) -> float:
         normalized = status.strip().lower()
@@ -143,6 +193,7 @@ async def serve(config: DaemonConfig) -> None:
             "failed": 4.0,
             "stopped": 5.0,
             "error": 6.0,
+            "completed": 7.0,
         }
         return codes.get(normalized, 99.0)
 
@@ -164,7 +215,11 @@ async def serve(config: DaemonConfig) -> None:
         )
 
     def _mark_runtime_heartbeat() -> None:
-        run_state.runtime_last_heartbeat = time.time()
+        now = time.time()
+        run_state.runtime_last_heartbeat = now
+        if run_state.runtime_status in {"starting", "running", "recovering"}:
+            timeout = max(config.runtime_heartbeat_timeout_secs, 1.0)
+            run_state.rollout_lease_deadline = now + timeout
 
     def _append_runtime_log(line: str) -> None:
         run_state.append_log(line)
@@ -193,6 +248,11 @@ async def serve(config: DaemonConfig) -> None:
             run_state.runtime_last_exit_code = exit_code
         _mark_runtime_heartbeat()
         _record_runtime_metrics()
+        _set_rollout_state(
+            observed=status,
+            desired=run_state.rollout_desired_state,
+            reason=reason if status in {"failed", "error"} else None,
+        )
         if previous_status != status:
             details = f" ({reason})" if reason else ""
             run_state.append_log(f"[system] runtime status -> {status}{details}")
@@ -294,6 +354,76 @@ async def serve(config: DaemonConfig) -> None:
             return "api"
         return "unknown"
 
+    def _resolve_env_key(keys: list[str]) -> str | None:
+        for key in keys:
+            if key in runtime_env_overrides:
+                return key
+            if os.getenv(key) is not None:
+                return key
+        return keys[0] if keys else None
+
+    def _read_env_int(key: str, default: int) -> int:
+        raw = runtime_env_overrides.get(key)
+        if raw is None:
+            raw = os.getenv(key)
+        if raw is None:
+            return default
+        try:
+            return int(float(str(raw).strip()))
+        except (TypeError, ValueError):
+            return default
+
+    def _set_runtime_env_override(key: str, value: int) -> None:
+        runtime_env_overrides[key] = str(value)
+
+    def _apply_oom_recovery_policy() -> list[str]:
+        if not config.oom_policy_enabled:
+            return []
+        changes: list[str] = []
+
+        batch_key = _resolve_env_key(config.oom_batch_env_keys)
+        if batch_key:
+            old_batch = _read_env_int(batch_key, config.oom_default_batch_size)
+            new_batch = max(config.oom_min_batch_size, old_batch // 2) if old_batch > 1 else 1
+            if new_batch != old_batch:
+                _set_runtime_env_override(batch_key, new_batch)
+                changes.append(f"{batch_key}: {old_batch} -> {new_batch}")
+
+        accum_key = _resolve_env_key(config.oom_accum_env_keys)
+        if accum_key:
+            old_accum = max(1, _read_env_int(accum_key, 1))
+            new_accum = min(config.oom_max_grad_accum, old_accum * 2)
+            if new_accum != old_accum:
+                _set_runtime_env_override(accum_key, new_accum)
+                changes.append(f"{accum_key}: {old_accum} -> {new_accum}")
+
+        seq_key = _resolve_env_key(config.oom_seq_env_keys)
+        if seq_key:
+            old_seq = _read_env_int(seq_key, 0)
+            if old_seq > 0:
+                new_seq = max(config.oom_min_seq_len, int(old_seq * 0.8))
+                if new_seq != old_seq:
+                    _set_runtime_env_override(seq_key, new_seq)
+                    changes.append(f"{seq_key}: {old_seq} -> {new_seq}")
+
+        if changes:
+            run_state.add_metric(
+                "runtime/oom_policy_applied",
+                1.0,
+                step=run_state.current_step,
+            )
+            run_state.append_log("[system] oom policy applied: " + " | ".join(changes))
+        else:
+            run_state.add_metric(
+                "runtime/oom_policy_applied",
+                0.0,
+                step=run_state.current_step,
+            )
+            run_state.append_log(
+                "[system] oom policy had no effect (no adjustable env keys found)"
+            )
+        return changes
+
     async def _stop_training_process() -> None:
         nonlocal runtime_adapter
         if runtime_adapter is None:
@@ -305,6 +435,19 @@ async def serve(config: DaemonConfig) -> None:
             if run_state.runtime_status not in {"failed", "error"}:
                 _set_runtime_state(status="stopped")
 
+    async def _handle_runtime_completion(status: str) -> None:
+        run_state.rollout_desired_state = status
+        _set_runtime_state(
+            status=status,
+            exit_code=0,
+            error_type=None,
+            failure_class=None,
+        )
+        run_state.runtime_failure_reason = None
+        run_state.runtime_error_type = None
+        run_state.runtime_failure_class = None
+        run_state.append_log("[system] training job completed")
+
     async def _restart_training_process(
         state: RunState,
         *,
@@ -312,6 +455,8 @@ async def serve(config: DaemonConfig) -> None:
     ) -> None:
         nonlocal runtime_adapter, runtime_retry_count
 
+        run_state.rollout_desired_state = "running"
+        run_state.rollout_generation += 1
         await _stop_training_process()
 
         runtime_adapter = build_runtime_adapter(
@@ -321,8 +466,10 @@ async def serve(config: DaemonConfig) -> None:
             socket_path=config.socket_path,
             run_dir=_resolve_run_dir(config.run_dir),
             training_cmd=config.training_cmd,
+            runtime_env_overrides=runtime_env_overrides,
             on_log=_append_runtime_log,
             on_failure=_handle_runtime_failure,
+            on_complete=_handle_runtime_completion,
             on_heartbeat=_mark_runtime_heartbeat,
         )
 
@@ -340,6 +487,8 @@ async def serve(config: DaemonConfig) -> None:
         run_state.runtime = runtime_ref["kind"]
         run_state.runtime_failure_reason = None
         run_state.runtime_error_type = None
+        run_state.runtime_failure_class = None
+        run_state.rollout_last_error = None
 
     async def _maybe_recover_runtime_failure(failure: RuntimeFailure) -> None:
         nonlocal runtime_retry_count
@@ -353,6 +502,9 @@ async def serve(config: DaemonConfig) -> None:
                 f"[error] runtime retry budget exhausted ({config.max_runtime_retries})"
             )
             return
+        failure_class = _classify_runtime_failure(failure)
+        if failure_class == "oom":
+            _apply_oom_recovery_policy()
         attempt = runtime_retry_count + 1
         runtime_retry_count = attempt
         run_state.runtime_restarts = attempt
@@ -375,6 +527,7 @@ async def serve(config: DaemonConfig) -> None:
     async def _handle_runtime_failure(failure: RuntimeFailure) -> None:
         async with runtime_failure_lock:
             failure_class = _classify_runtime_failure(failure)
+            run_state.rollout_desired_state = "running" if config.auto_mode else "failed"
             message = _runtime_failure_message(failure)
             _set_runtime_state(
                 status="failed",
@@ -447,6 +600,7 @@ async def serve(config: DaemonConfig) -> None:
                         alert_detector,
                         _restart_training_process,
                         runtime_ref,
+                        runtime_env_overrides,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -482,6 +636,19 @@ async def serve(config: DaemonConfig) -> None:
             if runtime_adapter is None:
                 continue
             if run_state.runtime_status != "running":
+                continue
+            deadline = run_state.rollout_lease_deadline
+            if deadline is not None and time.time() > deadline:
+                await _handle_runtime_failure(
+                    RuntimeFailure(
+                        status="timeout",
+                        error_type="ROLLOUT_LEASE_EXPIRED",
+                        message=(
+                            f"rollout lease expired at {deadline:.3f} "
+                            f"(now {time.time():.3f})"
+                        ),
+                    )
+                )
                 continue
             last = run_state.runtime_last_heartbeat
             if last is None:
@@ -519,6 +686,7 @@ async def serve(config: DaemonConfig) -> None:
             runtime_watchdog_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await runtime_watchdog_task
+            run_state.rollout_desired_state = "stopped"
             await _stop_training_process()
 
 
@@ -537,6 +705,7 @@ async def _handle_payload(
     alert_detector: AlertDetector,
     restart_training_callback: Callable[[RunState], Awaitable[None]] | None = None,
     runtime_ref: dict[str, RuntimeType] | None = None,
+    runtime_env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     msg_type = payload.get("type")
 
@@ -574,6 +743,14 @@ async def _handle_payload(
                 "runtime_restarts": run_state.runtime_restarts,
                 "runtime_last_heartbeat": run_state.runtime_last_heartbeat,
                 "runtime_last_exit_code": run_state.runtime_last_exit_code,
+                "runtime_env_overrides": dict(runtime_env_overrides or {}),
+                "rollout_id": run_state.rollout_id,
+                "rollout_desired_state": run_state.rollout_desired_state,
+                "rollout_observed_state": run_state.rollout_observed_state,
+                "rollout_generation": run_state.rollout_generation,
+                "rollout_lease_deadline": run_state.rollout_lease_deadline,
+                "rollout_last_transition_ts": run_state.rollout_last_transition_ts,
+                "rollout_last_error": run_state.rollout_last_error,
             },
         }
 
@@ -756,6 +933,59 @@ def main() -> None:
         default=float(os.getenv("OG_RUNTIME_HEARTBEAT_CHECK_SECS", "2")),
         help="Runtime heartbeat watchdog polling interval in seconds",
     )
+    parser.add_argument(
+        "--oom-policy",
+        default=os.getenv("OG_OOM_POLICY", "on"),
+        help="OOM recovery policy: on|off",
+    )
+    parser.add_argument(
+        "--oom-min-batch-size",
+        type=int,
+        default=int(os.getenv("OG_OOM_MIN_BATCH_SIZE", "1")),
+        help="Minimum batch size floor for OOM recovery",
+    )
+    parser.add_argument(
+        "--oom-default-batch-size",
+        type=int,
+        default=int(os.getenv("OG_OOM_DEFAULT_BATCH_SIZE", "32")),
+        help="Default batch size when OOM batch key has no current value",
+    )
+    parser.add_argument(
+        "--oom-max-grad-accum",
+        type=int,
+        default=int(os.getenv("OG_OOM_MAX_GRAD_ACCUM", "64")),
+        help="Maximum gradient accumulation value for OOM recovery",
+    )
+    parser.add_argument(
+        "--oom-min-seq-len",
+        type=int,
+        default=int(os.getenv("OG_OOM_MIN_SEQ_LEN", "128")),
+        help="Minimum sequence length floor when OOM recovery adjusts seq len",
+    )
+    parser.add_argument(
+        "--oom-batch-env-keys",
+        default=os.getenv(
+            "OG_OOM_BATCH_ENV_KEYS",
+            "DEMO_BATCH,BATCH_SIZE,MICRO_BATCH_SIZE,PER_DEVICE_TRAIN_BATCH_SIZE",
+        ),
+        help="Comma-separated env var keys to treat as batch size candidates",
+    )
+    parser.add_argument(
+        "--oom-accum-env-keys",
+        default=os.getenv(
+            "OG_OOM_ACCUM_ENV_KEYS",
+            "GRAD_ACCUM_STEPS,GRADIENT_ACCUMULATION_STEPS",
+        ),
+        help="Comma-separated env var keys to treat as grad accumulation candidates",
+    )
+    parser.add_argument(
+        "--oom-seq-env-keys",
+        default=os.getenv(
+            "OG_OOM_SEQ_ENV_KEYS",
+            "SEQ_LEN,MAX_SEQ_LEN,BLOCK_SIZE,CONTEXT_LENGTH",
+        ),
+        help="Comma-separated env var keys to treat as sequence-length candidates",
+    )
 
     args = parser.parse_args()
     if not args.training_file:
@@ -771,6 +1001,15 @@ def main() -> None:
     retry_backoff_max = max(float(args.runtime_retry_backoff_max_secs), retry_backoff)
     heartbeat_check = max(float(args.runtime_heartbeat_check_secs), 0.5)
     heartbeat_timeout = max(float(args.runtime_heartbeat_timeout_secs), heartbeat_check)
+    oom_policy_enabled = str(args.oom_policy).strip().lower() not in {
+        "0",
+        "off",
+        "false",
+        "no",
+    }
+    oom_batch_keys = [k.strip() for k in str(args.oom_batch_env_keys).split(",") if k.strip()]
+    oom_accum_keys = [k.strip() for k in str(args.oom_accum_env_keys).split(",") if k.strip()]
+    oom_seq_keys = [k.strip() for k in str(args.oom_seq_env_keys).split(",") if k.strip()]
 
     config = DaemonConfig(
         training_file=Path(args.training_file),
@@ -787,6 +1026,14 @@ def main() -> None:
         runtime_retry_backoff_max_secs=retry_backoff_max,
         runtime_heartbeat_timeout_secs=heartbeat_timeout,
         runtime_heartbeat_check_secs=heartbeat_check,
+        oom_policy_enabled=oom_policy_enabled,
+        oom_min_batch_size=max(int(args.oom_min_batch_size), 1),
+        oom_default_batch_size=max(int(args.oom_default_batch_size), 1),
+        oom_max_grad_accum=max(int(args.oom_max_grad_accum), 1),
+        oom_min_seq_len=max(int(args.oom_min_seq_len), 1),
+        oom_batch_env_keys=oom_batch_keys or ["DEMO_BATCH"],
+        oom_accum_env_keys=oom_accum_keys or ["GRAD_ACCUM_STEPS"],
+        oom_seq_env_keys=oom_seq_keys,
         alert_rules=alert_rules,
     )
     asyncio.run(serve(config))
