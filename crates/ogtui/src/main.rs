@@ -16,7 +16,7 @@ use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -29,6 +29,10 @@ struct TuiArgs {
     /// Path to a directory containing .tfevents files, or a single .tfevents file
     #[arg(short, long)]
     path: Option<PathBuf>,
+
+    /// Metric display labels JSON or CSV mapping (e.g. '{"train/loss":"Loss"}' or 'train/loss=Loss')
+    #[arg(long, env = "OG_GRAPH_LABELS")]
+    graph_labels: Option<String>,
 
     /// Training script to monitor (enables agent daemon)
     #[arg(short = 'f', long)]
@@ -98,7 +102,6 @@ impl AutoModeArg {
 #[serde(rename_all = "snake_case")]
 enum RuntimeArg {
     Local,
-    Prime,
     Modal,
 }
 
@@ -106,7 +109,6 @@ impl RuntimeArg {
     fn as_str(self) -> &'static str {
         match self {
             RuntimeArg::Local => "local",
-            RuntimeArg::Prime => "prime",
             RuntimeArg::Modal => "modal",
         }
     }
@@ -130,6 +132,10 @@ struct RunArgs {
     /// Graph selection JSON, e.g. '{"metrics":"loss","sys":"gpu"}'
     #[arg(long)]
     graph: Option<String>,
+
+    /// Metric display labels JSON or CSV mapping (e.g. '{"train/loss":"Loss"}' or 'train/loss=Loss')
+    #[arg(long, env = "OG_GRAPH_LABELS")]
+    graph_labels: Option<String>,
 
     /// Optional prompt sent to the agent after startup
     #[arg(long)]
@@ -424,6 +430,7 @@ fn execute_cli_command(command: OgCommand, json: bool) -> Result<()> {
 fn run_args_to_tui(args: &RunArgs) -> TuiArgs {
     TuiArgs {
         path: Some(args.path.clone()),
+        graph_labels: args.graph_labels.clone(),
         training_file: Some(args.file.clone()),
         training_cmd: args.training_cmd.clone(),
         start_training: true,
@@ -446,7 +453,13 @@ fn run_tui(
     clean_start: bool,
 ) -> Result<()> {
     let daemon_expected = tui.training_file.is_some() || tui.socket.is_some();
-    let events_path = tui.path.clone().unwrap_or_else(|| PathBuf::from("runs/"));
+    let metric_labels = parse_graph_labels(tui.graph_labels.as_deref())?;
+    let requested_path = tui.path.clone().unwrap_or_else(|| PathBuf::from("runs/"));
+    let events_path = if tui.training_file.is_some() && tui.start_training {
+        resolve_live_run_path(&requested_path)?
+    } else {
+        requested_path
+    };
     let mut initial = if clean_start {
         ViewData {
             scalars: BTreeMap::new(),
@@ -473,6 +486,7 @@ fn run_tui(
     };
     let mut app = App::new(
         initial.scalars,
+        metric_labels,
         initial.log_lines,
         app_path,
         initial.total_events,
@@ -601,6 +615,53 @@ fn parse_graph_filter(raw: &str) -> Result<GraphFilter> {
     Ok(GraphFilter { metrics, sys })
 }
 
+fn parse_graph_labels(raw: Option<&str>) -> Result<BTreeMap<String, String>> {
+    let Some(raw) = raw else {
+        return Ok(BTreeMap::new());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    if trimmed.starts_with('{') {
+        let parsed: Value = serde_json::from_str(trimmed)
+            .with_context(|| "parsing --graph-labels JSON".to_string())?;
+        let obj = parsed
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("--graph-labels JSON must be an object"))?;
+        let mut out = BTreeMap::new();
+        for (key, value) in obj {
+            let label = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("graph label for '{}' must be a string", key))?
+                .trim();
+            if !label.is_empty() {
+                out.insert(key.trim().to_string(), label.to_string());
+            }
+        }
+        return Ok(out);
+    }
+
+    let mut out = BTreeMap::new();
+    for pair in trimmed.split(',') {
+        let part = pair.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (metric, label) = part
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("invalid graph label '{}'; expected metric=Label", part))?;
+        let metric = metric.trim();
+        let label = label.trim();
+        if metric.is_empty() || label.is_empty() {
+            bail!("invalid graph label '{}'; metric and label must be non-empty", part);
+        }
+        out.insert(metric.to_string(), label.to_string());
+    }
+    Ok(out)
+}
+
 fn filter_scalars(
     scalars: BTreeMap<String, Vec<(f64, f64)>>,
     filter: &GraphFilter,
@@ -693,10 +754,8 @@ fn execute_tail(args: TailArgs) -> Result<CommandOutput> {
         let start = view.log_lines.len().saturating_sub(args.lines);
         lines.extend(view.log_lines[start..].iter().cloned());
     } else if target_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(|n| n.contains("tfevents"))
-        .unwrap_or(false)
+        .is_file()
+        && tfevents::is_tfevents_file(&target_path)
     {
         kind = "tfevents";
         let events = tfevents::parse_events_file(&target_path)?;
@@ -1166,13 +1225,54 @@ fn list_run_dirs(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(runs)
 }
 
+fn contains_tfevents_direct(path: &Path) -> Result<bool> {
+    if !path.exists() || !path.is_dir() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if entry_path.is_file() && tfevents::is_tfevents_file(&entry_path) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn resolve_live_run_path(path: &Path) -> Result<PathBuf> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+
+    if !path.exists() {
+        fs::create_dir_all(path)
+            .with_context(|| format!("creating run directory {}", path.display()))?;
+        return Ok(path.to_path_buf());
+    }
+
+    if !path.is_dir() {
+        return Ok(path.to_path_buf());
+    }
+
+    let has_direct_tfevents = contains_tfevents_direct(path)?;
+    if has_direct_tfevents {
+        return Ok(path.to_path_buf());
+    }
+
+    let has_nested_tfevents = contains_tfevents(path)?;
+    if has_nested_tfevents {
+        let child = path.join(format!("run-{}", unix_now_secs()));
+        fs::create_dir_all(&child)
+            .with_context(|| format!("creating run directory {}", child.display()))?;
+        return Ok(child);
+    }
+
+    Ok(path.to_path_buf())
+}
+
 fn contains_tfevents(path: &Path) -> Result<bool> {
     if path.is_file() {
-        return Ok(path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|n| n.contains("tfevents"))
-            .unwrap_or(false));
+        return Ok(tfevents::is_tfevents_file(path));
     }
 
     if !path.exists() || !path.is_dir() {
@@ -1186,12 +1286,7 @@ fn contains_tfevents(path: &Path) -> Result<bool> {
             if contains_tfevents(&entry_path)? {
                 return Ok(true);
             }
-        } else if entry_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|n| n.contains("tfevents"))
-            .unwrap_or(false)
-        {
+        } else if tfevents::is_tfevents_file(&entry_path) {
             return Ok(true);
         }
     }
@@ -1323,8 +1418,6 @@ fn spawn_daemon(
     training_cmd: Option<&str>,
     socket_path: &PathBuf,
 ) -> Result<Child> {
-    ensure_runtime_auth(runtime, true)?;
-
     // Prefer virtualenv Python for daemon dependencies, then fall back to system Python.
     let python = find_python(codebase_root);
     let agent_src = codebase_root.join("python").join("agent-chat");
@@ -1385,79 +1478,6 @@ fn spawn_daemon(
     })?;
 
     Ok(child)
-}
-
-fn ensure_runtime_auth(runtime: RuntimeArg, allow_interactive_login: bool) -> Result<()> {
-    if matches!(runtime, RuntimeArg::Prime) {
-        ensure_prime_auth(allow_interactive_login)?;
-    }
-    Ok(())
-}
-
-fn prime_auth_config_path() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(|home| PathBuf::from(home).join(".prime").join("config.json"))
-}
-
-fn has_prime_auth() -> bool {
-    if let Ok(value) = std::env::var("PRIME_API_KEY") {
-        if !value.trim().is_empty() {
-            return true;
-        }
-    }
-    prime_auth_config_path()
-        .map(|path| path.exists())
-        .unwrap_or(false)
-}
-
-fn ensure_prime_auth(allow_interactive_login: bool) -> Result<()> {
-    if has_prime_auth() {
-        return Ok(());
-    }
-
-    let message = "Prime auth missing. Run `uvx prime login` (or `uv run prime login`) or set `PRIME_API_KEY`.";
-    if !allow_interactive_login {
-        bail!("{message}");
-    }
-    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-        bail!("{message}");
-    }
-
-    eprintln!("Prime auth not found. Running login flow...");
-    let attempts: [(&str, &[&str], &str); 2] = [
-        ("uvx", &["prime", "login"], "uvx prime login"),
-        ("uv", &["run", "prime", "login"], "uv run prime login"),
-    ];
-    let mut attempted_any = false;
-    for (bin, args, label) in attempts {
-        match Command::new(bin).args(args).status() {
-            Ok(status) => {
-                attempted_any = true;
-                if status.success() && has_prime_auth() {
-                    eprintln!("Prime auth configured via `{label}`.");
-                    return Ok(());
-                }
-                eprintln!("`{label}` exited with status {status}.");
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                eprintln!("`{label}` unavailable (command not found).");
-            }
-            Err(err) => {
-                return Err(err.into());
-            }
-        }
-    }
-
-    if !attempted_any {
-        bail!(
-            "Prime auth missing and no uv command found. Install uv, then run `uvx prime login`, or set `PRIME_API_KEY`."
-        );
-    }
-    if has_prime_auth() {
-        return Ok(());
-    }
-    bail!("{message}")
 }
 
 /// Find a working Python interpreter.
@@ -1786,7 +1806,6 @@ fn execute_in_app_run_command(
     }
 
     let graph_filter = args.graph.as_deref().map(parse_graph_filter).transpose()?;
-    ensure_runtime_auth(args.runtime, false)?;
 
     let runtime = args.runtime.as_str();
     let resolved_runtime = socket_client::set_runtime(runtime, &app.daemon_socket)?;
@@ -2451,12 +2470,14 @@ mod tests {
     use super::{
         AutoModeArg, ListArgs, ListSubcommand, OgCommand, RuntimeArg, handle_in_app_og_command,
         normalize_live_log_line, parse_bang_og_cli, parse_elapsed_secs, parse_graph_filter,
-        parse_process_line, tail_overlap,
+        parse_graph_labels, parse_process_line, resolve_live_run_path, tail_overlap,
     };
     use crate::app::App;
+    use std::fs;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::mpsc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn tail_overlap_handles_sliding_windows() {
@@ -2564,10 +2585,10 @@ mod tests {
     #[test]
     fn parse_bang_og_run_runtime() {
         let cli =
-            parse_bang_og_cli("!og run demo_train.py --runtime prime").expect("parse command");
+            parse_bang_og_cli("!og run demo_train.py --runtime modal").expect("parse command");
         match cli.command {
             Some(OgCommand::Run(args)) => {
-                assert!(matches!(args.runtime, RuntimeArg::Prime));
+                assert!(matches!(args.runtime, RuntimeArg::Modal));
             }
             _ => panic!("expected run command"),
         }
@@ -2582,13 +2603,72 @@ mod tests {
     }
 
     #[test]
+    fn parse_graph_labels_accepts_json_mapping() {
+        let raw = r#"{"train/loss":"Loss","train/accuracy":"Acc"}"#;
+        let parsed = parse_graph_labels(Some(raw)).expect("parse graph labels");
+        assert_eq!(parsed.get("train/loss"), Some(&"Loss".to_string()));
+        assert_eq!(parsed.get("train/accuracy"), Some(&"Acc".to_string()));
+    }
+
+    #[test]
+    fn parse_graph_labels_accepts_csv_mapping() {
+        let raw = "train/loss=Loss,train/accuracy=Accuracy";
+        let parsed = parse_graph_labels(Some(raw)).expect("parse graph labels");
+        assert_eq!(parsed.get("train/loss"), Some(&"Loss".to_string()));
+        assert_eq!(parsed.get("train/accuracy"), Some(&"Accuracy".to_string()));
+    }
+
+    #[test]
     fn in_app_og_list_command_appends_system_message() {
-        let mut app = App::new(BTreeMap::new(), Vec::new(), PathBuf::from("runs"), 0, 0);
+        let mut app = App::new(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            PathBuf::from("runs"),
+            0,
+            0,
+        );
         let (tx, _rx) = mpsc::channel();
         handle_in_app_og_command("!og list projects --path runs/", &mut app, &tx)
             .expect("execute in-app command");
         let last = app.chat_messages.last().expect("chat message");
         assert_eq!(last.sender, "system");
         assert!(last.content.contains("projects"));
+    }
+
+    #[test]
+    fn resolve_live_run_path_creates_child_for_project_root_with_nested_runs() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ogtui-run-path-{nonce}"));
+        let runs = root.join("runs");
+        let old_run = runs.join("old-run");
+        fs::create_dir_all(&old_run).expect("create old run");
+        fs::write(old_run.join("events.out.tfevents.1"), b"x").expect("write marker");
+
+        let resolved = resolve_live_run_path(&runs).expect("resolve run path");
+        assert!(resolved.starts_with(&runs));
+        assert_ne!(resolved, runs);
+        assert!(resolved.exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_live_run_path_keeps_direct_tfevents_directory() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ogtui-run-path-direct-{nonce}"));
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("events.out.tfevents.1"), b"x").expect("write marker");
+
+        let resolved = resolve_live_run_path(&root).expect("resolve run path");
+        assert_eq!(resolved, root);
+
+        fs::remove_dir_all(&resolved).ok();
     }
 }

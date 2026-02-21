@@ -134,8 +134,8 @@ def _resolve_run_dir(path: Path | None) -> Path | None:
 
 def _normalize_runtime(value: str | None) -> RuntimeType:
     raw = (value or "local").strip().lower()
-    if raw not in {"local", "prime", "modal"}:
-        raise ValueError(f"unsupported runtime '{value}' (expected local|prime|modal)")
+    if raw not in {"local", "modal"}:
+        raise ValueError(f"unsupported runtime '{value}' (expected local|modal)")
     return raw  # type: ignore[return-value]
 
 
@@ -901,7 +901,7 @@ def main() -> None:
     parser.add_argument(
         "--runtime",
         default=os.getenv("OG_RUNTIME", "local"),
-        help="Training runtime backend: local|prime|modal",
+        help="Training runtime backend: local|modal",
     )
     parser.add_argument(
         "--max-runtime-retries",

@@ -6,7 +6,7 @@ from typing import Literal
 
 ActionType = Literal["explain", "refactor"]
 SenderType = Literal["user", "agent", "system"]
-RuntimeType = Literal["local", "prime", "modal"]
+RuntimeType = Literal["local", "modal"]
 
 
 @dataclass

@@ -78,6 +78,8 @@ pub struct App {
     pub active_tab: Tab,
     /// tag → sorted (step, value) pairs
     pub scalars: BTreeMap<String, Vec<(f64, f64)>>,
+    /// Optional display labels keyed by metric tag
+    pub metric_labels: BTreeMap<String, String>,
     /// Ordered list of tag names for grid iteration
     pub tags: Vec<String>,
     /// Log lines derived from events
@@ -163,6 +165,7 @@ pub struct App {
 impl App {
     pub fn new(
         scalars: BTreeMap<String, Vec<(f64, f64)>>,
+        metric_labels: BTreeMap<String, String>,
         log_lines: Vec<String>,
         events_path: PathBuf,
         total_events: usize,
@@ -173,6 +176,7 @@ impl App {
         Self {
             active_tab: Tab::Chat,
             scalars,
+            metric_labels,
             tags,
             log_lines,
             show_help: false,
@@ -213,6 +217,13 @@ impl App {
             process_sort: ProcessSort::Cpu,
             process_limit: 300,
         }
+    }
+
+    pub fn metric_display_name<'a>(&'a self, tag: &'a str) -> &'a str {
+        self.metric_labels
+            .get(tag)
+            .map(String::as_str)
+            .unwrap_or(tag)
     }
 
     pub fn set_process_preferences(&mut self, sort: ProcessSort, limit: usize) {
@@ -508,7 +519,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn empty_app() -> App {
-        App::new(BTreeMap::new(), Vec::new(), PathBuf::from("runs"), 0, 0)
+        App::new(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            PathBuf::from("runs"),
+            0,
+            0,
+        )
     }
 
     #[test]
@@ -543,5 +561,14 @@ mod tests {
         assert_eq!(app.running_processes.len(), 1);
         assert_eq!(app.exited_processes.len(), 1);
         assert_eq!(app.exited_processes[0].snapshot.pid, p1.pid);
+    }
+
+    #[test]
+    fn metric_display_name_uses_label_override() {
+        let mut app = empty_app();
+        app.metric_labels
+            .insert("train/loss".to_string(), "Loss".to_string());
+        assert_eq!(app.metric_display_name("train/loss"), "Loss");
+        assert_eq!(app.metric_display_name("train/accuracy"), "train/accuracy");
     }
 }
