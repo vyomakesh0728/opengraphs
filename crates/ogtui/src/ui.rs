@@ -288,12 +288,13 @@ fn draw_metric_card(f: &mut Frame, app: &App, tag: &str, area: Rect, selected: b
     } else {
         Style::default().fg(BORDER)
     };
+    let display_tag = app.metric_display_name(tag);
 
     // Shorten tag for display: show last path component if tag has slashes
     let max_title_len = (area.width as usize).saturating_sub(4);
-    let short_tag = if tag.len() > max_title_len {
+    let short_tag = if display_tag.len() > max_title_len {
         // Try to show the last segment after '/'
-        let last_seg = tag.rsplit('/').next().unwrap_or(tag);
+        let last_seg = display_tag.rsplit('/').next().unwrap_or(display_tag);
         if last_seg.len() <= max_title_len {
             last_seg.to_string()
         } else {
@@ -305,7 +306,7 @@ fn draw_metric_card(f: &mut Frame, app: &App, tag: &str, area: Rect, selected: b
             )
         }
     } else {
-        tag.to_string()
+        display_tag.to_string()
     };
 
     let block = Block::default()
@@ -1089,6 +1090,7 @@ fn draw_focused_metric(f: &mut Frame, app: &App, metric_idx: usize, area: Rect) 
             return;
         }
     };
+    let display_tag = app.metric_display_name(tag);
 
     let data = match app.scalars.get(tag) {
         Some(d) if !d.is_empty() => d,
@@ -1097,7 +1099,7 @@ fn draw_focused_metric(f: &mut Frame, app: &App, metric_idx: usize, area: Rect) 
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(GREEN))
                 .title(Span::styled(
-                    format!(" {} ", tag),
+                    format!(" {} ", display_tag),
                     Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
                 ));
             let p = Paragraph::new("No data")
@@ -1161,7 +1163,7 @@ fn draw_focused_metric(f: &mut Frame, app: &App, metric_idx: usize, area: Rect) 
     ];
 
     let dataset = Dataset::default()
-        .name(tag)
+        .name(display_tag)
         .marker(symbols::Marker::Braille)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(CHART_RAW));
@@ -1174,7 +1176,7 @@ fn draw_focused_metric(f: &mut Frame, app: &App, metric_idx: usize, area: Rect) 
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(GREEN))
                 .title(Span::styled(
-                    format!(" {} ", tag),
+                    format!(" {} ", display_tag),
                     Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
                 ))
                 .title_bottom(

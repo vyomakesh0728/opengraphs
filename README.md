@@ -22,11 +22,11 @@ Local-first, TUI-native experiment tracking for AI runs over SSH.
 
 Browser dashboards and port forwarding are painful on remote GPU boxes. `opengraphs` is built for terminal-native workflows:
 
-- fast experiment views in SSH sessions
-- lightweight local-first tracking
-- simple run comparison and filtering
+- Fast experiment views in SSH sessions
+- Lightweight local-first tracking
+- Simple run comparison and filtering
 - Rust-first core (ratatui TUI), with isolated Python for DSPy/RLM agent chat
-- agent auto-diagnoses training issues and can refactor code with `--auto`
+- Agent auto-diagnoses training issues and can refactor code with `--auto`
 
 ## Current workspace
 
@@ -47,7 +47,7 @@ Re-run the same command anytime to update to latest.
 Install a pinned version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scripts/install.sh | bash -s -- --version v0.1.5
+curl -fsSL https://raw.githubusercontent.com/vyomakesh0728/opengraphs/main/scripts/install.sh | bash -s -- --version v0.1.6
 ```
 
 Or run with `npx` (no manual install):
@@ -60,7 +60,7 @@ npx -y opengraphs-cli run demo_train.py --auto autonomous
 Pinned `npx` version:
 
 ```bash
-npx -y opengraphs-cli@0.1.5
+npx -y opengraphs-cli@0.1.6
 ```
 
 Global npm install:
@@ -122,14 +122,32 @@ Runtime backends:
 
 ```bash
 og run demo_train.py --runtime local
-og run demo_train.py --runtime prime
 og run demo_train.py --runtime modal
 ```
 
-`local` is the default. `prime` is production-ready for fail-fast sandbox monitoring + recovery.
+`local` is the default.
 `modal` is currently a scaffold that runs via local execution while the remote adapter is finalized.
-When using `--runtime prime` from CLI and auth is missing, OpenGraphs will attempt
-`uvx prime login` (fallback: `uv run prime login`) before startup.
+
+When `og run` points at a parent directory that already contains older runs (for example `runs/`), OpenGraphs creates a fresh `run-<timestamp>` subdirectory automatically so logs/graphs start clean.
+
+Metric display labels (applies to local/modal graph views):
+
+```bash
+og run demo_train.py --runtime local \
+  --graph-labels '{"train/loss":"Loss","train/accuracy":"Accuracy"}'
+```
+
+You can also use `metric=Label` CSV style:
+
+```bash
+og run demo_train.py --graph-labels "train/loss=Loss,train/accuracy=Accuracy"
+```
+
+Or set once via env:
+
+```bash
+export OG_GRAPH_LABELS='{"train/loss":"Loss","train/accuracy":"Accuracy"}'
+```
 
 ## Quickstart (developer)
 
@@ -156,6 +174,7 @@ The TUI has a built-in **chat** tab that connects to the Python agent daemon via
 - **DSPy RLM** for codebase exploration and code editing
 - **`--auto` mode**: agent applies unified diffs to your training script and restarts training
 - **Checkpoint/rollback**: every refactor is checkpointed; failures auto-rollback
+
 ## Live training metrics (single terminal)
 
 ```bash
@@ -192,19 +211,9 @@ cargo run -p ogtui -- --path runs/<current-run-id>
 In chat tab, you can run CLI commands inline with `!og`:
 
 ```text
-!og run demo_train.py --runtime prime --auto autonomous
+!og run demo_train.py --runtime modal --auto autonomous
 !og list runs --path runs/
 !og get metric --path runs/ --run <run-id> --metric train/loss
-```
-
-Prime runtime environment (when using `--runtime prime`):
-
-```bash
-export PRIME_API_KEY="..."
-export OG_PRIME_DOCKER_IMAGE="python:3.11-slim"
-export OG_PRIME_CPU_CORES=2
-export OG_PRIME_MEMORY_GB=8
-export OG_MAX_RUNTIME_RETRIES=2
 ```
 
 ## Stars graph

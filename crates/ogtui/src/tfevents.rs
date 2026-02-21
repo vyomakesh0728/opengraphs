@@ -63,6 +63,26 @@ pub struct LoadedRun {
     pub events: Vec<ScalarEvent>,
 }
 
+/// Return true only for likely TensorBoard event files.
+pub fn is_tfevents_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    is_tfevents_filename(name)
+}
+
+fn is_tfevents_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".tgz")
+        || lower.ends_with(".tar.gz")
+        || lower.ends_with(".zip")
+        || lower.ends_with(".gz")
+    {
+        return false;
+    }
+    lower.contains(".tfevents.") || lower.ends_with(".tfevents")
+}
+
 // ── Record-level reader ─────────────────────────────────────────────────────
 
 /// TF record format per record:
@@ -153,17 +173,15 @@ pub fn parse_events_file(path: &Path) -> Result<Vec<ScalarEvent>> {
 
 fn discover_event_files(path: &Path) -> Result<Vec<PathBuf>> {
     if path.is_file() {
-        return Ok(vec![path.to_path_buf()]);
+        if is_tfevents_file(path) {
+            return Ok(vec![path.to_path_buf()]);
+        }
+        return Ok(Vec::new());
     }
 
     let mut files = Vec::new();
     for entry in walkdir(path)? {
-        if entry
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .contains("tfevents")
-        {
+        if is_tfevents_file(&entry) {
             files.push(entry);
         }
     }
@@ -216,4 +234,20 @@ fn walkdir(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
         }
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_tfevents_file;
+    use std::path::Path;
+
+    #[test]
+    fn detects_real_tfevents_and_ignores_archives() {
+        assert!(is_tfevents_file(Path::new(
+            "events.out.tfevents.1771672979.job-abc123"
+        )));
+        assert!(is_tfevents_file(Path::new("model.tfevents")));
+        assert!(!is_tfevents_file(Path::new("tfevents_latest.tgz")));
+        assert!(!is_tfevents_file(Path::new("events.out.tfevents.1.tar.gz")));
+    }
 }
