@@ -11,6 +11,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Literal, Protocol
@@ -240,12 +241,15 @@ class PrimeRuntimeAdapter:
         self._resume_checkpoint_dir_remote: str | None = None
         self._last_sync_at: float = 0.0
         self._last_checkpoint_marker: str | None = None
+        self._sandbox_tag: str | None = None
 
     def _prime_workdir(self) -> str:
         return os.getenv("OG_PRIME_WORKDIR", "/workspace")
 
     def _prime_name(self) -> str:
-        return f"opengraphs-{int(time.time())}"
+        if self._sandbox_tag:
+            return f"opengraphs-{self._sandbox_tag[:12]}"
+        return f"opengraphs-{uuid.uuid4().hex[:12]}"
 
     def _prime_cpu_cores(self) -> float:
         return float(os.getenv("OG_PRIME_CPU_CORES", "2"))
@@ -254,7 +258,19 @@ class PrimeRuntimeAdapter:
         return float(os.getenv("OG_PRIME_MEMORY_GB", "8"))
 
     def _prime_timeout_minutes(self) -> int:
-        return int(os.getenv("OG_PRIME_TIMEOUT_MINUTES", "180"))
+        return int(os.getenv("OG_PRIME_TIMEOUT_MINUTES", "60"))
+
+    def _prime_teardown_mode(self) -> str:
+        mode = os.getenv("OG_PRIME_SANDBOX_TEARDOWN", "cleanup").strip().lower()
+        if mode not in {"cleanup", "kill"}:
+            return "cleanup"
+        return mode
+
+    def _prime_labels(self) -> list[str]:
+        labels = ["opengraphs", "runtime:prime"]
+        if self._sandbox_tag:
+            labels.append(f"run:{self._sandbox_tag[:12]}")
+        return labels
 
     def _poll_interval_secs(self) -> float:
         return float(os.getenv("OG_PRIME_POLL_INTERVAL_SECS", "2"))
@@ -632,6 +648,18 @@ class PrimeRuntimeAdapter:
                 self._sandbox_id = None
                 self._job = None
 
+    async def _teardown_sandbox(self, sandbox_id: str, reason: str) -> None:
+        mode = self._prime_teardown_mode()
+        if mode == "cleanup":
+            with contextlib.suppress(Exception):
+                await self._maybe_sync_artifacts(force=True)
+        else:
+            self.on_log(
+                "[system] prime sandbox teardown mode=kill "
+                "(skipping artifact sync before delete)"
+            )
+        await self._delete_sandbox(sandbox_id, reason)
+
     async def _monitor_loop(self) -> None:
         assert self._client is not None
         while not self._stop_requested:
@@ -643,8 +671,6 @@ class PrimeRuntimeAdapter:
                 self.on_heartbeat()
                 status = (sandbox.status or "").upper()
                 if status in {"ERROR", "TERMINATED", "TIMEOUT", "STOPPED"}:
-                    with contextlib.suppress(Exception):
-                        await self._maybe_sync_artifacts(force=True)
                     await self._notify_failure(
                         status=status.lower(),
                         error_type=sandbox.error_type,
@@ -662,13 +688,11 @@ class PrimeRuntimeAdapter:
                 if job_status.completed:
                     await self._append_tail_lines("stdout", job_status.stdout or "")
                     await self._append_tail_lines("stderr", job_status.stderr or "")
-                    with contextlib.suppress(Exception):
-                        await self._maybe_sync_artifacts(force=True)
                     exit_code = int(job_status.exit_code or 0)
                     self.on_log(f"[system] prime job exited with code {exit_code}")
                     current_sandbox = self._sandbox_id
                     if current_sandbox:
-                        await self._delete_sandbox(current_sandbox, "job completed")
+                        await self._teardown_sandbox(current_sandbox, "job completed")
                     if exit_code == 0:
                         self.on_log("[system] prime job completed successfully")
                         await self.on_complete("completed")
@@ -712,6 +736,7 @@ class PrimeRuntimeAdapter:
         self._stdout_tail = []
         self._stderr_tail = []
         self._last_sync_at = 0.0
+        self._sandbox_tag = uuid.uuid4().hex
         self._ensure_prime_auth()
         self._require_prime()
         assert self._client is not None
@@ -723,13 +748,16 @@ class PrimeRuntimeAdapter:
             cpu_cores=self._prime_cpu_cores(),
             memory_gb=self._prime_memory_gb(),
             timeout_minutes=self._prime_timeout_minutes(),
-            labels=["opengraphs", "runtime:prime"],
+            labels=self._prime_labels(),
             team_id=self._prime_team_id,
         )
 
         sandbox = await self._client.create(request)
         self._sandbox_id = sandbox.id
-        self.on_log(f"[system] prime sandbox created: {sandbox.id}")
+        self.on_log(
+            f"[system] prime sandbox created: {sandbox.id} "
+            f"(tag={self._sandbox_tag[:12] if self._sandbox_tag else 'n/a'})"
+        )
 
         await self._client.wait_for_creation(
             sandbox.id, max_attempts=self._max_wait_attempts()
@@ -795,15 +823,14 @@ class PrimeRuntimeAdapter:
         self._monitor_task = None
 
         if self._sandbox_id is not None:
-            with contextlib.suppress(Exception):
-                await self._maybe_sync_artifacts(force=True)
-            await self._delete_sandbox(self._sandbox_id, "runtime stop")
+            await self._teardown_sandbox(self._sandbox_id, "runtime stop")
 
         self._sandbox_id = None
         self._job = None
         self._resume_checkpoint_dir_remote = None
         self._stdout_tail = []
         self._stderr_tail = []
+        self._sandbox_tag = None
 
     async def close(self) -> None:
         await self.stop()
