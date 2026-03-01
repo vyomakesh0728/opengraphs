@@ -30,6 +30,10 @@ struct TuiArgs {
     #[arg(short, long)]
     path: Option<PathBuf>,
 
+    /// Graph selection JSON, e.g. '{"metrics":"loss","sys":"gpu"}'
+    #[arg(long = "graph", visible_alias = "graphs")]
+    graph: Option<String>,
+
     /// Metric display labels JSON or CSV mapping (e.g. '{"train/loss":"Loss"}' or 'train/loss=Loss')
     #[arg(long, env = "OG_GRAPH_LABELS")]
     graph_labels: Option<String>,
@@ -130,7 +134,7 @@ struct RunArgs {
     path: PathBuf,
 
     /// Graph selection JSON, e.g. '{"metrics":"loss","sys":"gpu"}'
-    #[arg(long)]
+    #[arg(long = "graph", visible_alias = "graphs")]
     graph: Option<String>,
 
     /// Metric display labels JSON or CSV mapping (e.g. '{"train/loss":"Loss"}' or 'train/loss=Loss')
@@ -410,7 +414,13 @@ fn main() -> Result<()> {
     }
 
     let clean_start = cli.tui.path.is_none();
-    run_tui(&cli.tui, None, None, clean_start)
+    let graph_filter = cli
+        .tui
+        .graph
+        .as_deref()
+        .map(parse_graph_filter)
+        .transpose()?;
+    run_tui(&cli.tui, None, graph_filter, clean_start)
 }
 
 fn execute_cli_command(command: OgCommand, json: bool) -> Result<()> {
@@ -430,6 +440,7 @@ fn execute_cli_command(command: OgCommand, json: bool) -> Result<()> {
 fn run_args_to_tui(args: &RunArgs) -> TuiArgs {
     TuiArgs {
         path: Some(args.path.clone()),
+        graph: args.graph.clone(),
         graph_labels: args.graph_labels.clone(),
         training_file: Some(args.file.clone()),
         training_cmd: args.training_cmd.clone(),
@@ -2468,10 +2479,12 @@ fn run_app<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoModeArg, ListArgs, ListSubcommand, OgCommand, RuntimeArg, handle_in_app_og_command,
-        normalize_live_log_line, parse_bang_og_cli, parse_elapsed_secs, parse_graph_filter,
-        parse_graph_labels, parse_process_line, resolve_live_run_path, tail_overlap,
+        AutoModeArg, Cli, ListArgs, ListSubcommand, OgCommand, RuntimeArg,
+        handle_in_app_og_command, normalize_live_log_line, parse_bang_og_cli, parse_elapsed_secs,
+        parse_graph_filter, parse_graph_labels, parse_process_line, resolve_live_run_path,
+        tail_overlap,
     };
+    use clap::Parser;
     use crate::app::App;
     use std::fs;
     use std::collections::BTreeMap;
@@ -2592,6 +2605,25 @@ mod tests {
             }
             _ => panic!("expected run command"),
         }
+    }
+
+    #[test]
+    fn parse_bang_og_run_graphs_alias() {
+        let cli = parse_bang_og_cli("!og run demo_train.py --graphs '{\"metrics\":\"loss\"}'")
+            .expect("parse command");
+        match cli.command {
+            Some(OgCommand::Run(args)) => {
+                assert_eq!(args.graph.as_deref(), Some("{\"metrics\":\"loss\"}"));
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn parse_top_level_graphs_alias() {
+        let cli = Cli::try_parse_from(["og", "--path", "runs/", "--graphs", "{\"metrics\":\"loss\"}"])
+            .expect("parse cli");
+        assert_eq!(cli.tui.graph.as_deref(), Some("{\"metrics\":\"loss\"}"));
     }
 
     #[test]

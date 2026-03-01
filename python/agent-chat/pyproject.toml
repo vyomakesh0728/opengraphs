@@ -7,3 +7,12 @@ dependencies = [
   "trackio>=0.15.0",
   "unidiff>=0.7.5",
 ]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.4,<9",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
