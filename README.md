@@ -18,22 +18,6 @@ Local-first, TUI-native experiment tracking for AI runs over SSH.
 
 - Video (MP4): [Kapture 2026-02-16 at 11.41.29](screenshots/Kapture%202026-02-16%20at%2011.41.29.mp4)
 
-## Why this exists
-
-Browser dashboards and port forwarding are painful on remote GPU boxes. `opengraphs` is built for terminal-native workflows:
-
-- Fast experiment views in SSH sessions
-- Lightweight local-first tracking
-- Simple run comparison and filtering
-- Rust-first core (ratatui TUI), with isolated Python for DSPy/RLM agent chat
-- Agent auto-diagnoses training issues and can refactor code with `--auto`
-
-## Current workspace
-
-- `crates/ogtui`: Rust ratatui TUI (graphs, logs, agent chat tabs)
-- `crates/ogd`: daemon/backend + Trackio Rust client integration point
-- `python/agent-chat`: Python agent daemon (DSPy RLM + ReAct, alerts, code patching)
-
 ## Install (users)
 
 One-line installer (always latest release):
@@ -165,15 +149,6 @@ python3 -m og_agent_chat.server --training-file train.py --codebase-root .
 # Or with auto-refactor mode
 python3 -m og_agent_chat.server --training-file train.py --codebase-root . --auto
 ```
-
-## Agent chat
-
-The TUI has a built-in **chat** tab that connects to the Python agent daemon via Unix socket.
-
-- **DSPy ReAct** for tool-calling (reads metrics, logs, codebase)
-- **DSPy RLM** for codebase exploration and code editing
-- **`--auto` mode**: agent applies unified diffs to your training script and restarts training
-- **Checkpoint/rollback**: every refactor is checkpointed; failures auto-rollback
 
 ## Live training metrics (single terminal)
 
