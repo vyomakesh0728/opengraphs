@@ -1212,3 +1212,77 @@ fn draw_focused_metric(f: &mut Frame, app: &App, metric_idx: usize, area: Rect) 
     .alignment(Alignment::Center);
     f.render_widget(stats, chunks[1]);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_label_maps_known_process_states() {
+        assert_eq!(state_label("R"), "running");
+        assert_eq!(state_label("S"), "sleeping");
+        assert_eq!(state_label("D"), "io-wait");
+        assert_eq!(state_label("T"), "stopped");
+        assert_eq!(state_label("Z"), "zombie");
+        assert_eq!(state_label("I"), "idle");
+        assert_eq!(state_label("?"), "other");
+        assert_eq!(state_label(""), "sleeping");
+    }
+
+    #[test]
+    fn truncate_text_handles_zero_short_and_exact_widths() {
+        assert_eq!(truncate_text("abcdef", 0), "");
+        assert_eq!(truncate_text("abcdef", 2), "..");
+        assert_eq!(truncate_text("abcdef", 3), "...");
+        assert_eq!(truncate_text("abcdef", 4), "a...");
+        assert_eq!(truncate_text("abcd", 4), "abcd");
+    }
+
+    #[test]
+    fn format_ago_uses_seconds_minutes_hours_and_days() {
+        assert_eq!(format_ago(59), "59s ago");
+        assert_eq!(format_ago(60), "1m ago");
+        assert_eq!(format_ago(3_599), "59m ago");
+        assert_eq!(format_ago(3_600), "1h ago");
+        assert_eq!(format_ago(86_399), "23h ago");
+        assert_eq!(format_ago(86_400), "1d ago");
+    }
+
+    #[test]
+    fn format_value_switches_between_fixed_and_scientific_notation() {
+        assert_eq!(format_value(12.34567), "12.3457");
+        assert_eq!(format_value(0.0), "0.0000");
+        assert_eq!(format_value(0.0005), "5.00e-4");
+        assert_eq!(format_value(12_345.0), "1.23e4");
+    }
+
+    #[test]
+    fn style_for_log_line_classifies_common_prefixes() {
+        assert_eq!(
+            style_for_log_line("[error] boom"),
+            Style::default().fg(LOG_ERROR).add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            style_for_log_line("[sucess] fixed"),
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            style_for_log_line("[IMPORTANT] heads up"),
+            Style::default()
+                .fg(LOG_IMPORTANT)
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            style_for_log_line("[info] note"),
+            Style::default().fg(LOG_INFO_ASH)
+        );
+        assert_eq!(
+            style_for_log_line("-- separator"),
+            Style::default().fg(BORDER)
+        );
+        assert_eq!(
+            style_for_log_line("plain log line"),
+            Style::default().fg(TEXT_LIGHT)
+        );
+    }
+}

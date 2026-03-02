@@ -660,13 +660,16 @@ fn parse_graph_labels(raw: Option<&str>) -> Result<BTreeMap<String, String>> {
         if part.is_empty() {
             continue;
         }
-        let (metric, label) = part
-            .split_once('=')
-            .ok_or_else(|| anyhow::anyhow!("invalid graph label '{}'; expected metric=Label", part))?;
+        let (metric, label) = part.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("invalid graph label '{}'; expected metric=Label", part)
+        })?;
         let metric = metric.trim();
         let label = label.trim();
         if metric.is_empty() || label.is_empty() {
-            bail!("invalid graph label '{}'; metric and label must be non-empty", part);
+            bail!(
+                "invalid graph label '{}'; metric and label must be non-empty",
+                part
+            );
         }
         out.insert(metric.to_string(), label.to_string());
     }
@@ -764,10 +767,7 @@ fn execute_tail(args: TailArgs) -> Result<CommandOutput> {
         let view = load_view_data(&target_path)?;
         let start = view.log_lines.len().saturating_sub(args.lines);
         lines.extend(view.log_lines[start..].iter().cloned());
-    } else if target_path
-        .is_file()
-        && tfevents::is_tfevents_file(&target_path)
-    {
+    } else if target_path.is_file() && tfevents::is_tfevents_file(&target_path) {
         kind = "tfevents";
         let events = tfevents::parse_events_file(&target_path)?;
         let start = events.len().saturating_sub(args.lines);
@@ -2484,10 +2484,10 @@ mod tests {
         parse_graph_filter, parse_graph_labels, parse_process_line, resolve_live_run_path,
         tail_overlap,
     };
-    use clap::Parser;
     use crate::app::App;
-    use std::fs;
+    use clap::Parser;
     use std::collections::BTreeMap;
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2621,8 +2621,14 @@ mod tests {
 
     #[test]
     fn parse_top_level_graphs_alias() {
-        let cli = Cli::try_parse_from(["og", "--path", "runs/", "--graphs", "{\"metrics\":\"loss\"}"])
-            .expect("parse cli");
+        let cli = Cli::try_parse_from([
+            "og",
+            "--path",
+            "runs/",
+            "--graphs",
+            "{\"metrics\":\"loss\"}",
+        ])
+        .expect("parse cli");
         assert_eq!(cli.tui.graph.as_deref(), Some("{\"metrics\":\"loss\"}"));
     }
 

@@ -24,3 +24,8 @@ apps/promo/package-lock.json
 # Agent checkpoints
 .og_checkpoints/
 python/agent-chat/og_agent_chat.egg-info/
+
+# Local analyzer artifacts
+analyze-codebase.sh
+summary*.md
+summay*.md
