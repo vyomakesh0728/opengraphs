@@ -14,7 +14,7 @@ use crate::app::{App, ProcessSort, Tab};
 
 // ── Colors (matching the TypeScript TUI) ────────────────────────────────────
 const GREEN: Color = Color::Rgb(46, 204, 113); // #2ecc71
-const BORDER: Color = Color::Rgb(107, 114, 128); // #6b7280
+const BORDER: Color = Color::Rgb(244, 250, 255); // crystal white
 const TEXT_DIM: Color = Color::Rgb(155, 163, 175); // #9BA3AF
 const TEXT_LIGHT: Color = Color::Rgb(209, 213, 219); // #d1d5db
 const BG_DARK: Color = Color::Rgb(13, 17, 23); // #0d1117
@@ -23,6 +23,17 @@ const CHART_SMOOTH: Color = Color::Rgb(255, 165, 0); // orange for smoothed
 const LOG_INFO_ASH: Color = Color::Rgb(148, 163, 184); // ash
 const LOG_ERROR: Color = Color::Rgb(248, 113, 113); // bright red
 const LOG_IMPORTANT: Color = Color::Rgb(251, 191, 36); // bright amber
+const LOGO_GREEN_TOP: Color = Color::Rgb(134, 239, 172);
+const LOGO_GREEN_MID: Color = Color::Rgb(46, 204, 113);
+const LOGO_GREEN_BOTTOM: Color = Color::Rgb(12, 104, 58);
+const OPENGRAPHS_LOGO_ROWS: [&str; 6] = [
+    "  ██████╗  ██████╗  ███████╗ ███╗   ██╗  ██████╗  ██████╗   █████╗  ██████╗  ██╗  ██╗ ███████╗",
+    " ██╔═══██╗ ██╔══██╗ ██╔════╝ ████╗  ██║ ██╔════╝  ██╔══██╗ ██╔══██╗ ██╔══██╗ ██║  ██║ ██╔════╝",
+    " ██║   ██║ ██████╔╝ █████╗   ██╔██╗ ██║ ██║  ███╗ ██████╔╝ ███████║ ██████╔╝ ███████║ ███████╗",
+    " ██║   ██║ ██╔═══╝  ██╔══╝   ██║╚██╗██║ ██║   ██║ ██╔══██╗ ██╔══██║ ██╔═══╝  ██╔══██║ ╚════██║",
+    " ╚██████╔╝ ██║      ███████╗ ██║ ╚████║ ╚██████╔╝ ██║  ██║ ██║  ██║ ██║      ██║  ██║ ███████║",
+    "  ╚═════╝  ╚═╝      ╚══════╝ ╚═╝  ╚═══╝  ╚═════╝  ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝      ╚═╝  ╚═╝ ╚══════╝",
+];
 
 /// Clickable regions tracked for mouse hit-testing.
 #[derive(Default, Clone)]
@@ -151,17 +162,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, regions: &mut LayoutRegions
 
     f.render_widget(tabs, header_chunks[0]);
 
-    // Step progress area
-    let step_info = format!(
-        " {} tags │ {} events │ step {}",
-        app.tags.len(),
-        app.total_events,
-        app.max_step,
-    );
-    let step_block = Paragraph::new(Line::from(Span::styled(
-        step_info,
-        Style::default().fg(TEXT_DIM),
-    )))
+    // Step progress area with an htop-style horizontal meter.
+    let step_block = Paragraph::new(build_step_meter_line(
+        app,
+        header_chunks[1].width.saturating_sub(4),
+    ))
     .block(
         Block::default()
             .borders(Borders::ALL)
@@ -169,6 +174,55 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, regions: &mut LayoutRegions
             .title(Span::styled(" step progress ", Style::default().fg(BORDER))),
     );
     f.render_widget(step_block, header_chunks[1]);
+}
+
+fn current_metric_step(app: &App) -> i64 {
+    app.tags
+        .get(app.selected_metric)
+        .and_then(|tag| app.scalars.get(tag))
+        .and_then(|points| points.last())
+        .map(|point| point.0.round() as i64)
+        .unwrap_or(app.max_step)
+        .max(0)
+}
+
+fn build_step_meter_line(app: &App, available_width: u16) -> Line<'static> {
+    let current = current_metric_step(app);
+    let total = app.max_step.max(current).max(1);
+    let ratio = (current as f64 / total as f64).clamp(0.0, 1.0);
+    let prefix = format!(
+        " {} tags │ {} events │ step {}/{} ",
+        app.tags.len(),
+        app.total_events,
+        current,
+        total,
+    );
+    let prefix_width = prefix.chars().count() as u16;
+    let bar_width = available_width.saturating_sub(prefix_width) as usize;
+
+    if bar_width < 6 {
+        return Line::from(Span::styled(
+            prefix,
+            Style::default().fg(TEXT_LIGHT).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let filled = ((bar_width as f64) * ratio).round() as usize;
+    let filled = filled.min(bar_width);
+    let empty = bar_width.saturating_sub(filled);
+
+    Line::from(vec![
+        Span::styled(
+            prefix,
+            Style::default().fg(TEXT_LIGHT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("█".repeat(filled), Style::default().fg(GREEN)),
+        Span::styled("░".repeat(empty), Style::default().fg(TEXT_DIM)),
+    ])
+}
+
+fn opengraphs_inline_brand() -> Line<'static> {
+    Line::from(Span::styled(" opengraphs ", Style::default().fg(BORDER))).alignment(Alignment::Right)
 }
 
 // ── Graphs Tab ──────────────────────────────────────────────────────────────
@@ -423,7 +477,8 @@ fn draw_stats_panel(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(BORDER))
-        .title(Span::styled(" stats ", Style::default().fg(BORDER)));
+        .title(Span::styled(" stats ", Style::default().fg(BORDER)))
+        .title_bottom(opengraphs_inline_brand());
 
     let paragraph = Paragraph::new(lines)
         .block(block)
@@ -463,7 +518,8 @@ fn draw_logs_tab(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(BORDER))
-        .title(Span::styled(" logs ", Style::default().fg(BORDER)));
+        .title(Span::styled(" logs ", Style::default().fg(BORDER)))
+        .title_bottom(opengraphs_inline_brand());
 
     if app.log_lines.is_empty() {
         let msg = Paragraph::new("No events loaded")
@@ -562,7 +618,8 @@ fn draw_processes_tab(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(BORDER))
-        .title(Span::styled(" processes ", Style::default().fg(BORDER)));
+        .title(Span::styled(" processes ", Style::default().fg(BORDER)))
+        .title_bottom(opengraphs_inline_brand());
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -708,6 +765,148 @@ const CHAT_AGENT: Color = Color::Rgb(96, 165, 250); // blue for agent
 const CHAT_SYSTEM: Color = Color::Rgb(107, 114, 128); // dim gray for system
 // reserved: const CHAT_INPUT_BG: Color = Color::Rgb(30, 35, 44);
 
+fn compact_brand_line(word: &str, palette: &[Color]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (idx, ch) in word.chars().enumerate() {
+        let mut label = ch.to_string();
+        if idx + 1 != word.chars().count() {
+            label.push(' ');
+        }
+        spans.push(Span::styled(
+            label,
+            Style::default()
+                .fg(palette[idx % palette.len()])
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn logo_row_color(row: u16, height: u16) -> Color {
+    if height <= 1 {
+        return LOGO_GREEN_MID;
+    }
+    let position = row as f32 / (height.saturating_sub(1)) as f32;
+    if position <= 0.5 {
+        let local = position / 0.5;
+        Color::Rgb(
+            (134.0 + (46.0 - 134.0) * local).round() as u8,
+            (239.0 + (204.0 - 239.0) * local).round() as u8,
+            (172.0 + (113.0 - 172.0) * local).round() as u8,
+        )
+    } else {
+        let local = (position - 0.5) / 0.5;
+        Color::Rgb(
+            (46.0 + (12.0 - 46.0) * local).round() as u8,
+            (204.0 + (104.0 - 204.0) * local).round() as u8,
+            (113.0 + (58.0 - 113.0) * local).round() as u8,
+        )
+    }
+}
+
+fn logo_lines() -> Vec<Line<'static>> {
+    OPENGRAPHS_LOGO_ROWS
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            Line::from(Span::styled(
+                row.trim_end().to_string(),
+                Style::default()
+                    .fg(logo_row_color(idx as u16, OPENGRAPHS_LOGO_ROWS.len() as u16))
+                    .add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect()
+}
+
+fn ogd_status_line(app: &App) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(" ogd sock ", Style::default().fg(TEXT_LIGHT)),
+        Span::styled(
+            "●",
+            Style::default()
+                .fg(if app.daemon_connected {
+                    GREEN
+                } else {
+                    Color::Yellow
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    if app.agent_thinking {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("thinking...", Style::default().fg(TEXT_DIM)));
+    }
+
+    if app.pending_refactor.is_some() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            "pending refactor",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    Line::from(spans)
+}
+
+fn draw_chat_brand(f: &mut Frame, area: Rect) {
+    if area.width < 12 || area.height < 3 {
+        return;
+    }
+
+    let cwd = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let cwd = truncate_text(&cwd, area.width.saturating_sub(2) as usize);
+    let version = format!("(v{})", env!("CARGO_PKG_VERSION"));
+    let logo_width = OPENGRAPHS_LOGO_ROWS
+        .iter()
+        .map(|row| row.trim_end().chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    let logo_height = OPENGRAPHS_LOGO_ROWS.len() as u16;
+
+    if area.width < logo_width || area.height < logo_height + 2 {
+        let compact = Paragraph::new(vec![
+            compact_brand_line(
+                "opengraphs",
+                &[
+                    LOGO_GREEN_TOP,
+                    LOGO_GREEN_MID,
+                    LOGO_GREEN_BOTTOM,
+                    LOGO_GREEN_BOTTOM,
+                    LOGO_GREEN_MID,
+                    LOGO_GREEN_TOP,
+                ],
+            ),
+            Line::from(Span::styled(version.clone(), Style::default().fg(TEXT_LIGHT))),
+            Line::from(Span::styled(cwd, Style::default().fg(TEXT_DIM))),
+        ])
+        .alignment(Alignment::Left);
+        f.render_widget(compact, area);
+        return;
+    }
+
+    let logo_area = Rect::new(area.x, area.y, area.width, logo_height);
+    let meta_area = Rect::new(
+        area.x,
+        area.y + logo_area.height,
+        area.width,
+        area.height.saturating_sub(logo_area.height),
+    );
+
+    let logo = Paragraph::new(logo_lines()).alignment(Alignment::Left);
+    f.render_widget(logo, logo_area);
+
+    let meta = Paragraph::new(vec![
+        Line::from(Span::styled(version, Style::default().fg(TEXT_LIGHT))),
+        Line::from(Span::styled(cwd, Style::default().fg(TEXT_DIM))),
+    ])
+    .alignment(Alignment::Left);
+    f.render_widget(meta, meta_area);
+}
+
 fn draw_chat_tab(f: &mut Frame, app: &mut App, area: Rect) {
     // Layout: banner (0-2) | messages (fill) | refactor prompt (0 or 3) | input (3) | status (1)
     let has_banner = app.auto_mode;
@@ -744,7 +943,7 @@ fn draw_chat_tab(f: &mut Frame, app: &mut App, area: Rect) {
     if has_refactor {
         let refactor_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
+            .border_style(Style::default().fg(BORDER))
             .title(Span::styled(
                 " pending refactor ",
                 Style::default()
@@ -769,25 +968,7 @@ fn draw_chat_tab(f: &mut Frame, app: &mut App, area: Rect) {
     draw_chat_input(f, app, chunks[3]);
 
     // Status bar
-    let status_style = if app.pending_refactor.is_some() {
-        Style::default().fg(Color::Yellow)
-    } else if app.daemon_connected {
-        Style::default().fg(GREEN)
-    } else {
-        Style::default().fg(Color::Red)
-    };
-    let thinking_indicator = if app.agent_thinking {
-        " 🔄 thinking..."
-    } else {
-        ""
-    };
-    let status_text = format!(
-        " {} │ {}{}",
-        app.chat_status,
-        app.daemon_socket.display(),
-        thinking_indicator,
-    );
-    let status = Paragraph::new(Line::from(Span::styled(status_text, status_style)));
+    let status = Paragraph::new(ogd_status_line(app));
     f.render_widget(status, chunks[4]);
 }
 
@@ -801,6 +982,9 @@ fn draw_chat_messages(f: &mut Frame, app: &mut App, area: Rect) {
         ));
 
     if app.chat_messages.is_empty() && !app.daemon_connected {
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
         let help_lines = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -826,22 +1010,47 @@ fn draw_chat_messages(f: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(TEXT_LIGHT),
             )),
         ];
+
+        if inner.height < 11 {
+            let p = Paragraph::new(help_lines)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: false });
+            f.render_widget(p, inner);
+            return;
+        }
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(8)])
+            .split(inner);
         let p = Paragraph::new(help_lines)
-            .block(block)
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: false });
-        f.render_widget(p, area);
+        f.render_widget(p, chunks[0]);
+        draw_chat_brand(f, chunks[1]);
         return;
     }
 
     if app.chat_messages.is_empty() {
+        let inner = block.inner(area);
+        f.render_widget(block, area);
         let msg = Paragraph::new(Line::from(Span::styled(
             "No messages yet. Type a message and press Enter.",
             Style::default().fg(TEXT_DIM),
         )))
-        .block(block)
         .alignment(Alignment::Center);
-        f.render_widget(msg, area);
+
+        if inner.height < 9 {
+            f.render_widget(msg, inner);
+            return;
+        }
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(8)])
+            .split(inner);
+        f.render_widget(msg, chunks[0]);
+        draw_chat_brand(f, chunks[1]);
         return;
     }
 
@@ -897,24 +1106,22 @@ fn draw_chat_messages(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_chat_input(f: &mut Frame, app: &App, area: Rect) {
-    let border_color = if app.chat_input_focused {
-        GREEN
-    } else {
-        BORDER
-    };
+    let border_color = BORDER;
+    let title_color = if app.chat_input_focused { GREEN } else { BORDER };
     let title = if app.chat_input_focused {
         " type message or !og command (Enter=send, Esc=unfocus) "
     } else {
-        " press 'i' to type "
+        " (i) insert "
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
-        .title(Span::styled(title, Style::default().fg(border_color)));
+        .title(Span::styled(title, Style::default().fg(title_color)))
+        .title_bottom(opengraphs_inline_brand());
 
     let display_text = if app.chat_input.is_empty() && !app.chat_input_focused {
-        "Type a message or !og run demo_train.py ...".to_string()
+        " Type message or !og run demo_train.py ...".to_string()
     } else if app.chat_input_focused {
         format!("{}█", app.chat_input)
     } else {
@@ -922,7 +1129,7 @@ fn draw_chat_input(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let style = if app.chat_input.is_empty() && !app.chat_input_focused {
-        Style::default().fg(TEXT_DIM)
+        Style::default().fg(TEXT_DIM).add_modifier(Modifier::DIM)
     } else {
         Style::default().fg(TEXT_LIGHT)
     };
@@ -1014,10 +1221,6 @@ fn draw_footer(f: &mut Frame, _app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("Tab", Style::default().fg(GREEN)),
             Span::styled(" switch │ ", Style::default().fg(BORDER)),
-            Span::styled("i", Style::default().fg(GREEN)),
-            Span::styled(" type │ ", Style::default().fg(BORDER)),
-            Span::styled("Enter", Style::default().fg(GREEN)),
-            Span::styled(" send │ ", Style::default().fg(BORDER)),
             Span::styled("j/k", Style::default().fg(GREEN)),
             Span::styled(" scroll │ ", Style::default().fg(BORDER)),
             Span::styled("F6", Style::default().fg(GREEN)),
@@ -1026,8 +1229,6 @@ fn draw_footer(f: &mut Frame, _app: &App, area: Rect) {
             Span::styled(" help │ ", Style::default().fg(BORDER)),
             Span::styled("q", Style::default().fg(GREEN)),
             Span::styled(" quit", Style::default().fg(BORDER)),
-            Span::raw("    "),
-            Span::styled("opengraphs", Style::default().fg(BORDER)),
         ])
     } else if _app.active_tab == Tab::Graphs {
         Line::from(vec![
@@ -1043,8 +1244,6 @@ fn draw_footer(f: &mut Frame, _app: &App, area: Rect) {
             Span::styled(" scroll │ ", Style::default().fg(BORDER)),
             Span::styled("F6", Style::default().fg(GREEN)),
             Span::styled(" copy", Style::default().fg(BORDER)),
-            Span::raw("    "),
-            Span::styled("opengraphs", Style::default().fg(BORDER)),
         ])
     } else {
         Line::from(vec![
@@ -1058,8 +1257,6 @@ fn draw_footer(f: &mut Frame, _app: &App, area: Rect) {
             Span::styled(" scroll │ ", Style::default().fg(BORDER)),
             Span::styled("F6", Style::default().fg(GREEN)),
             Span::styled(" copy", Style::default().fg(BORDER)),
-            Span::raw("    "),
-            Span::styled("opengraphs", Style::default().fg(BORDER)),
         ])
     };
 
@@ -1097,7 +1294,7 @@ fn draw_focused_metric(f: &mut Frame, app: &App, metric_idx: usize, area: Rect) 
         _ => {
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(GREEN))
+                .border_style(Style::default().fg(BORDER))
                 .title(Span::styled(
                     format!(" {} ", display_tag),
                     Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
@@ -1174,7 +1371,7 @@ fn draw_focused_metric(f: &mut Frame, app: &App, metric_idx: usize, area: Rect) 
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(GREEN))
+                .border_style(Style::default().fg(BORDER))
                 .title(Span::styled(
                     format!(" {} ", display_tag),
                     Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
@@ -1366,8 +1563,18 @@ mod tests {
         assert_screen_contains(&screen, "Agent chat is not connected.");
         assert_screen_contains(&screen, "Start with built-in daemon:");
         assert_screen_contains(&screen, "ogtui --path runs/ --training-file train.py");
-        assert_screen_contains(&screen, "Disconnected");
-        assert_screen_contains(&screen, "press 'i' to type");
+        assert_screen_contains(&screen, "ogd sock");
+        assert_screen_contains(&screen, "(i) insert");
+        assert_screen_contains(&screen, "opengraphs");
+        assert_screen_contains(&screen, "██████╗  ██████╗  ███████╗");
+        assert_screen_contains(&screen, &format!("(v{})", env!("CARGO_PKG_VERSION")));
+        assert_screen_contains(
+            &screen,
+            &std::env::current_dir()
+                .expect("cwd should resolve")
+                .display()
+                .to_string(),
+        );
     }
 
     #[test]
@@ -1393,7 +1600,7 @@ mod tests {
         assert_eq!(regions.metric_card_rects.len(), 1);
         assert_screen_contains(&screen, "1 tags");
         assert_screen_contains(&screen, "42 events");
-        assert_screen_contains(&screen, "step 3");
+        assert_screen_contains(&screen, "step 3/3");
         assert_screen_contains(&screen, "metrics (1)");
         assert_screen_contains(&screen, "Loss");
         assert_screen_contains(&screen, "0.5000");
