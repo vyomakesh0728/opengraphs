@@ -1216,6 +1216,76 @@ fn draw_focused_metric(f: &mut Frame, app: &App, metric_idx: usize, area: Rect) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+
+    use crate::app::{App, Tab};
+
+    fn empty_app() -> App {
+        App::new(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            PathBuf::from("runs/demo"),
+            0,
+            0,
+        )
+    }
+
+    fn app_with_metric() -> App {
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "train/loss".to_string(),
+            vec![(1.0, 2.0), (2.0, 1.25), (3.0, 0.5)],
+        );
+
+        let mut labels = BTreeMap::new();
+        labels.insert("train/loss".to_string(), "Loss".to_string());
+
+        App::new(
+            scalars,
+            labels,
+            Vec::new(),
+            PathBuf::from("runs/demo"),
+            42,
+            3,
+        )
+    }
+
+    fn render_screen(app: &mut App, width: u16, height: u16) -> (String, LayoutRegions) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test backend should initialize");
+        let mut regions = LayoutRegions::default();
+
+        terminal
+            .draw(|f| {
+                regions = draw(f, app);
+            })
+            .expect("UI should render into the test backend");
+
+        (buffer_to_string(terminal.backend().buffer()), regions)
+    }
+
+    fn buffer_to_string(buffer: &Buffer) -> String {
+        let mut lines = Vec::with_capacity(buffer.area.height as usize);
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            lines.push(line);
+        }
+        lines.join("\n")
+    }
+
+    fn assert_screen_contains(screen: &str, needle: &str) {
+        assert!(
+            screen.contains(needle),
+            "expected screen to contain {needle:?}\n\nscreen:\n{screen}"
+        );
+    }
 
     #[test]
     fn state_label_maps_known_process_states() {
@@ -1284,5 +1354,66 @@ mod tests {
             style_for_log_line("plain log line"),
             Style::default().fg(TEXT_LIGHT)
         );
+    }
+
+    #[test]
+    fn draw_shows_disconnected_chat_guidance_and_status() {
+        let mut app = empty_app();
+
+        let (screen, regions) = render_screen(&mut app, 100, 30);
+
+        assert_eq!(regions.tab_rects.len(), Tab::ALL.len());
+        assert_screen_contains(&screen, "Agent chat is not connected.");
+        assert_screen_contains(&screen, "Start with built-in daemon:");
+        assert_screen_contains(&screen, "ogtui --path runs/ --training-file train.py");
+        assert_screen_contains(&screen, "Disconnected");
+        assert_screen_contains(&screen, "press 'i' to type");
+    }
+
+    #[test]
+    fn draw_overlays_help_modal_shortcuts() {
+        let mut app = empty_app();
+        app.show_help = true;
+
+        let (screen, _) = render_screen(&mut app, 100, 30);
+
+        assert_screen_contains(&screen, "shortcuts");
+        assert_screen_contains(&screen, "Toggle this help");
+        assert_screen_contains(&screen, "Apply pending refactor");
+        assert_screen_contains(&screen, "Focus chat input");
+    }
+
+    #[test]
+    fn draw_graphs_tab_renders_header_stats_and_metric_output() {
+        let mut app = app_with_metric();
+        app.active_tab = Tab::Graphs;
+
+        let (screen, regions) = render_screen(&mut app, 120, 30);
+
+        assert_eq!(regions.metric_card_rects.len(), 1);
+        assert_screen_contains(&screen, "1 tags");
+        assert_screen_contains(&screen, "42 events");
+        assert_screen_contains(&screen, "step 3");
+        assert_screen_contains(&screen, "metrics (1)");
+        assert_screen_contains(&screen, "Loss");
+        assert_screen_contains(&screen, "0.5000");
+        assert_screen_contains(&screen, "path:   runs/demo");
+    }
+
+    #[test]
+    fn draw_focused_metric_renders_detail_header_and_stats() {
+        let mut app = app_with_metric();
+        app.active_tab = Tab::Graphs;
+        app.focused_metric = Some(0);
+
+        let (screen, _) = render_screen(&mut app, 120, 30);
+
+        assert_screen_contains(&screen, "Loss");
+        assert_screen_contains(&screen, "Esc to close");
+        assert_screen_contains(&screen, "latest: 0.5000");
+        assert_screen_contains(&screen, "min: 0.5000");
+        assert_screen_contains(&screen, "max: 2.0000");
+        assert_screen_contains(&screen, "points: 3");
+        assert_screen_contains(&screen, "steps: 1–3");
     }
 }
