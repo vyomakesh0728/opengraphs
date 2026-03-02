@@ -4,7 +4,13 @@ This changelog is intentionally minimal and mirrors the tagged releases currentl
 
 ## Unreleased
 
-- Added focused `ogtui` test coverage for socket protocol handling and UI helper formatting.
+- No unreleased entries yet.
+
+## 0.1.7
+
+- Added practical production-hardening across the repo with conventional test suites, CI checks, config scaffolding, daemon integration coverage, TUI render coverage, and basic `ogd` coverage.
+- Published aligned `0.1.7` versions across the Rust crates, Python packages, and the `opengraphs-cli` npm package.
+- Polished the `ogtui` interface with crystal white panel borders, a compact `ogd sock` status indicator, an htop-style step meter, and refined chat/panel inline branding.
 
 ## 0.1.6
 
